@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [2.0.0] - 08:33 CEST 30-10-2026
 
 ### Fixed
 
@@ -612,6 +612,7 @@
 - Message logging system
 - Basic test suite
 
+[2.0.0]: https://github.com/MattFor/logeye/releases/tag/v2.0.0
 [1.6.2]: https://github.com/MattFor/logeye/releases/tag/v1.6.2
 [1.6.1]: https://github.com/MattFor/logeye/releases/tag/v1.6.1
 [1.6.0]: https://github.com/MattFor/logeye/releases/tag/v1.6.0
