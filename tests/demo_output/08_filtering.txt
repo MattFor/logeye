@@ -1,0 +1,38 @@
+--- level='call': only calls and returns ---
+(call) simulate args=(3)
+(return) simulate args=(3) -> 33.0
+
+--- level='state': no call lines, just what changes and the result ---
+(set) simulate.steps = 1
+(set) simulate.position = 0.0
+(set) simulate.velocity = 10.0
+(set) simulate.fuel = 100
+(change) simulate.velocity = 10.5
+(change) simulate.position = 10.5
+(change) simulate.fuel = 97
+(return) simulate args=(1) -> 10.5
+
+--- filter=: only the variables named ---
+(set) simulate.fuel = 100
+(change) simulate.fuel = 97
+(change) simulate.fuel = 94
+(change) simulate.fuel = 91
+
+--- threshold=: only changes big enough to matter ---
+(call) simulate args=(4)
+(set) simulate.steps = 4
+(set) simulate.position = 0.0
+(set) simulate.velocity = 10.0
+(set) simulate.fuel = 100
+(change) simulate.position = 10.5
+(change) simulate.velocity = 11.0
+(change) simulate.position = 21.5
+(change) simulate.fuel = 94
+(change) simulate.position = 33.0
+(change) simulate.position = 45.0
+(change) simulate.fuel = 88
+(return) simulate args=(4) -> 45.0
+
+--- A threshold works on logged values outside functions too ---
+(set) temperature = 20.0
+(change) temperature = 21.0

@@ -1,3 +1,4 @@
+import os
 import sys
 import json
 import inspect
@@ -5,7 +6,7 @@ import threading
 
 import pytest
 
-from logeye import log, watch, set_output_formatter, stop_watching
+from logeye import log, watch, set_mode, set_output_formatter, stop_watching
 from logeye import config, watcher
 from logeye.wrappers import LoggedDict, LoggedList, LoggedSet, _wrap_value
 
@@ -211,15 +212,24 @@ def test_generator_send_round_trip_is_preserved():
 	assert generator.send("payload") == "payload"
 
 
-def test_async_function_warns_instead_of_silently_doing_nothing():
+def test_async_function_body_is_traced_across_awaits(capsys):
+	import asyncio
+
 	@log
-	async def coro():
-		return 1
+	async def accumulate(n):
+		total = 0
+		for step in range(n):
+			total += step
+			await asyncio.sleep(0)
+		return total
 
-	with pytest.warns(RuntimeWarning, match="cannot trace"):
-		awaitable = coro()
+	assert inspect.iscoroutinefunction(accumulate)
+	assert asyncio.run(accumulate(3)) == 3
 
-	awaitable.close()
+	raw, _ = capture(capsys)
+
+	assert_has(raw, "accumulate.total = 3")
+	assert_has(raw, "(return) accumulate args=(3) -> 3")
 
 
 class _Item:
@@ -587,3 +597,428 @@ def test_watch_state_is_capped():
 		watcher._slot(watcher._g_watched_names, code, set).add("value")
 
 	assert len(watcher._g_watched_names) <= watcher._MAX_TRACKED_CODES
+
+
+# =====================================
+#  1.7.0: bugs found in the 1.6.2 audit
+# =====================================
+
+
+def test_decorated_subclass_of_a_decorated_class_reports_once(capsys):
+	@log
+	class Base:
+		def __init__(self, x):
+			self.x = x
+
+	@log
+	class Derived(Base):
+		pass
+
+	derived = Derived(1)
+
+	raw, ls = capture(capsys)
+
+	assert derived.x == 1
+	assert sum("__init__" in line for line in ls) == 1, raw
+	assert sum("derived.x = 1" in line for line in ls) == 1, raw
+
+
+def test_class_with_only_new_still_constructs():
+	@log
+	class Tag:
+		def __new__(cls, value):
+			obj = super().__new__(cls)
+			obj.value = value
+			return obj
+
+	assert Tag(5).value == 5
+
+
+def test_class_without_init_or_new_still_rejects_arguments():
+	@log
+	class Empty:
+		pass
+
+	with pytest.raises(TypeError):
+		Empty(1)
+
+
+def test_generator_return_value_reaches_yield_from():
+	@log
+	def inner():
+		yield 1
+		return "done"
+
+	def outer():
+		result = yield from inner()
+		yield result
+
+	assert list(outer()) == [1, "done"]
+
+
+def test_every_throw_reaches_the_generator():
+	@log
+	def resilient():
+		while True:
+			try:
+				yield "ready"
+			except ValueError:
+				pass
+
+	generator = resilient()
+	next(generator)
+
+	assert generator.throw(ValueError) == "ready"
+	assert generator.throw(ValueError) == "ready"
+
+	generator.close()
+
+
+def test_async_function_stays_a_coroutine_function_and_logs_its_result(capsys):
+	import asyncio
+
+	@log
+	async def double(x):
+		return x * 2
+
+	assert inspect.iscoroutinefunction(double)
+	assert asyncio.run(double(2)) == 4
+
+	raw, _ = capture(capsys)
+
+	assert_has(raw, "(call) ")
+	assert_has(raw, "double args=(2) -> 4")
+
+
+def test_educational_mode_never_prints_a_raw_payload(capsys):
+	obj = log({"x": 1, "d": {"k": 1}}, mode="edu")
+	set_mode("edu")
+
+	try:
+		obj.x = 10
+		obj.d.update({"k": 2})
+		obj.d.clear()
+	finally:
+		set_mode("full")
+
+	raw, _ = capture(capsys)
+
+	assert_not_has(raw, "'op'")
+	assert_has(raw, "obj.x = 10")
+
+
+def test_in_place_or_on_a_logged_dict_is_logged(capsys):
+	mapping = LoggedDict({"a": 1}, "mapping")
+	mapping |= {"b": 2}
+
+	raw, _ = capture(capsys)
+
+	assert dict(mapping) == {"a": 1, "b": 2}
+	assert_has(raw, "{'a': 1, 'b': 2}")
+
+
+def test_first_argument_is_kept_whatever_its_type(capsys):
+	@log
+	def make(kind, value):
+		return kind(value)
+
+	@log
+	class Unit:
+		def __init__(self):
+			self.n = 1
+
+	@log
+	def show(obj, extra):
+		return extra
+
+	make(int, "5")
+	show(Unit(), 7)
+
+	raw, _ = capture(capsys)
+
+	assert_has(raw, "make args=(<class 'int'>, '5')")
+	assert_has(raw, "show args=(<")
+
+
+def test_method_of_a_plain_class_does_not_show_self(capsys):
+	class Calc:
+		@log
+		def add(self, a, b):
+			return a + b
+
+	assert Calc().add(1, 2) == 3
+
+	raw, _ = capture(capsys)
+
+	assert_has(raw, "add args=(1, 2)")
+	assert_not_has(raw, "object at")
+
+
+def test_source_that_cannot_be_read_logs_a_message_not_a_placeholder(capsys):
+	exec("from logeye import watch\nx = watch(5)\n", {})
+
+	raw, _ = capture(capsys)
+
+	assert_not_has(raw, "PLACEHOLDER")
+	assert_has(raw, "5")
+
+
+def test_bare_log_of_a_container_is_a_message(capsys):
+	log([1, 2, 3])
+	log({"a": 1})
+
+	raw, _ = capture(capsys)
+
+	assert_has(raw, "[1, 2, 3]")
+	assert_has(raw, "{'a': 1}")
+	assert_not_has(raw, "set =")
+
+
+def test_format_arguments_are_never_template_expanded(capsys):
+	secret = "hunter2"
+	log("typed: {}", "$secret")
+
+	raw, _ = capture(capsys)
+
+	assert secret
+	assert_has(raw, "typed: $secret")
+	assert_not_has(raw, "hunter2")
+
+
+def test_template_values_are_expanded_once(capsys):
+	secret = "hunter2"
+	shown = "$secret"
+	log("value: $shown")
+
+	raw, _ = capture(capsys)
+
+	assert secret and shown
+	assert_has(raw, "value: $secret")
+
+
+def test_template_values_with_braces_survive_format_arguments(capsys):
+	data = {"a": 1}
+	log("$data and {}", 2)
+
+	raw, _ = capture(capsys)
+
+	assert data
+	assert_has(raw, "{'a': 1} and 2")
+
+
+def test_logging_a_plain_instance_reports_it(capsys):
+	class Plain:
+		pass
+
+	instance = log(Plain())
+
+	raw, _ = capture(capsys)
+
+	assert type(instance) is Plain
+	assert_has(raw, "instance = <")
+
+
+def test_watch_inside_a_logged_function_keeps_the_function_traced(capsys):
+	@log
+	def f():
+		x = watch(1)
+		x = 2
+		return x
+
+	assert f() == 2
+
+	raw, _ = capture(capsys)
+
+	assert_has(raw, "f.x = 2")
+	assert_has(raw, "(return) f -> 2")
+
+
+def test_watch_threshold_applies_inside_a_logged_function(capsys):
+	@log
+	def f():
+		y = 5 | log(threshold=("absolute", 2))
+		y += 1
+		y += 2
+		return y
+
+	f()
+
+	raw, ls = capture(capsys)
+
+	assert sum(".y = 6" in line for line in ls) == 0, raw
+	assert sum(".y = 8" in line for line in ls) == 1, raw
+
+
+def test_a_raising_repr_does_not_crash_the_program(capsys):
+	class Broken:
+		def __repr__(self):
+			raise RuntimeError("repr is broken")
+
+	@log
+	def f(obj):
+		local = obj
+		return 1
+
+	assert f(Broken()) == 1
+
+	raw, _ = capture(capsys)
+	assert_has(raw, "could not format")
+
+
+def test_log_above_staticmethod_and_classmethod(capsys):
+	class Tools:
+		@log
+		@staticmethod
+		def increment(x):
+			return x + 1
+
+		@log
+		@classmethod
+		def name(cls):
+			return cls.__name__
+
+	assert Tools().increment(1) == 2
+	assert Tools.increment(1) == 2
+	assert Tools.name() == "Tools"
+
+	raw, _ = capture(capsys)
+	assert_has(raw, "increment args=(1) -> 2")
+
+
+def test_watch_keeps_an_earlier_tracer_working():
+	seen = []
+
+	def recorder(frame, event, arg):
+		if frame.f_code is helper.__code__:
+			seen.append(event)
+		return recorder
+
+	def helper():
+		value = 1
+		return value
+
+	sys.settrace(recorder)
+	try:
+		x = watch(1)
+		helper()
+	finally:
+		sys.settrace(None)
+
+	assert x == 1
+	assert "line" in seen, seen
+
+
+def test_project_paths_across_windows_drives_do_not_crash(capsys, monkeypatch):
+	import os.path
+
+	def no_relative_path(*_):
+		raise ValueError("path is on mount 'D:', start on mount 'C:'")
+
+	monkeypatch.setattr(os.path, "relpath", no_relative_path)
+
+	log("relative: $rpath")
+
+	raw, _ = capture(capsys)
+	assert_has(raw, "relative: ")
+
+
+def test_code_under_the_interpreter_prefix_is_not_treated_as_the_stdlib():
+	from logeye.introspection.frames import _is_external_code
+
+	assert not _is_external_code(os.path.join(sys.prefix, "src", "app", "main.py"))
+	assert _is_external_code(json.__file__)
+
+
+def test_set_updates_from_generators_log_their_values(capsys):
+	wrapped = LoggedSet({1, 2, 3}, name="wrapped")
+	wrapped.difference_update(x for x in (1,))
+
+	raw, _ = capture(capsys)
+
+	assert wrapped == {2, 3}
+	assert_has(raw, "[[1]]")
+
+
+def test_nested_function_return_reports_its_own_arguments(capsys):
+	@log(mode="edu")
+	def hypotenuse(a, b):
+		def square(v):
+			return v * v
+
+		return (square(a) + square(b)) ** 0.5
+
+	hypotenuse(3, 4)
+
+	raw, _ = capture(capsys)
+
+	assert_has(raw, "hypotenuse.square(3) returned 9")
+	assert_has(raw, "hypotenuse.square(4) returned 16")
+
+
+def test_instance_is_named_after_a_plain_assignment(capsys):
+	@log
+	class Account:
+		def __init__(self):
+			self.balance = 0
+
+	savings = Account()
+	savings.balance = 5
+
+	raw, _ = capture(capsys)
+
+	assert_has(raw, "savings.balance = 5")
+	assert_not_has(raw, "account.balance")
+
+
+def test_default_pop_reads_as_pop(capsys):
+	stack = log([1, 2])
+	stack.pop()
+
+	raw, _ = capture(capsys)
+
+	assert_has(raw, "stack.pop() -> 2")
+
+
+def test_comprehension_loop_variables_are_not_reported_as_locals(capsys):
+	@log
+	def table(keys):
+		distances = {key: 0 for key in keys}
+		squares = [n * n for n in range(3)]
+		return distances, squares
+
+	table("ab")
+
+	raw, _ = capture(capsys)
+
+	assert_not_has(raw, ".key =")
+	assert_not_has(raw, ".n =")
+	assert_not_has(raw, "comp>")
+	assert_has(raw, ".squares = [0, 1, 4]")
+
+
+def test_nested_function_inside_a_generator_reports_its_return(capsys):
+	@log
+	def numbers():
+		def double(v):
+			return v * 2
+
+		yield double(1)
+
+	assert list(numbers()) == [2]
+
+	raw, _ = capture(capsys)
+
+	assert_has(raw, "(return) numbers.double args=(1) -> 2")
+
+
+def test_generator_yields_follow_educational_mode(capsys):
+	@log(mode="edu")
+	def numbers():
+		yield 1
+
+	assert list(numbers()) == [1]
+
+	raw, _ = capture(capsys)
+
+	assert_has(raw, "numbers yielded 1")
+	assert_not_has(raw, "(yield)")

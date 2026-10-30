@@ -1,0 +1,102 @@
+--- Full trace, narrowed to the two structures that matter ---
+(set) dijkstra.distances = {'A': inf, 'B': inf, 'C': inf, 'D': inf}
+(change) dijkstra.distances.A = 0
+(set) dijkstra.queue = [(0, 'A')]
+(change) heappop(dijkstra.queue) -> (0, 'A') | []
+(change) dijkstra.distances.B = 1
+(change) heappush(dijkstra.queue, (1, 'B')) -> [(1, 'B')]
+(change) dijkstra.distances.C = 4
+(change) heappush(dijkstra.queue, (4, 'C')) -> [(1, 'B'), (4, 'C')]
+(change) heappop(dijkstra.queue) -> (1, 'B') | [(4, 'C')]
+(change) dijkstra.distances.C = 3
+(change) heappush(dijkstra.queue, (3, 'C')) -> [(3, 'C'), (4, 'C')]
+(change) dijkstra.distances.D = 6
+(change) heappush(dijkstra.queue, (6, 'D')) -> [(3, 'C'), (4, 'C'), (6, 'D')]
+(change) heappop(dijkstra.queue) -> (3, 'C') | [(4, 'C'), (6, 'D')]
+(change) dijkstra.distances.D = 4
+(change) heappush(dijkstra.queue, (4, 'D')) -> [(4, 'C'), (6, 'D'), (4, 'D')]
+(change) heappop(dijkstra.queue) -> (4, 'C') | [(4, 'D'), (6, 'D')]
+(change) heappop(dijkstra.queue) -> (4, 'D') | [(6, 'D')]
+(change) heappop(dijkstra.queue) -> (6, 'D') | []
+
+--- Educational mode ---
+Calling dijkstra({'A': {'B': 1, 'C': 4}, 'B': {'C': 2, 'D': 5}, 'C': {'D': 1}, 'D': {}}, 'A')
+Defined dijkstra.graph = {'A': {'B': 1, 'C': 4}, 'B': {'C': 2, 'D': 5}, 'C': {'D': 1}, 'D': {}}
+Defined dijkstra.start = 'A'
+Defined dijkstra.distances = {'A': inf, 'B': inf, 'C': inf, 'D': inf}
+Set dijkstra.distances.A = 0
+Defined dijkstra.visited = set()
+Defined dijkstra.queue = [(0, 'A')]
+Popped (0, 'A') from queue
+Defined dijkstra.distance = 0
+Defined dijkstra.node = 'A'
+Added A to visited
+Defined dijkstra.neighbour = 'B'
+Defined dijkstra.weight = 1
+Defined dijkstra.candidate = 1
+Set dijkstra.distances.B = 1
+Pushed (1, 'B') onto queue
+dijkstra.neighbour = 'C'
+dijkstra.weight = 4
+dijkstra.candidate = 4
+Set dijkstra.distances.C = 4
+Pushed (4, 'C') onto queue
+Popped (1, 'B') from queue
+dijkstra.distance = 1
+dijkstra.node = 'B'
+Added B to visited
+dijkstra.weight = 2
+dijkstra.candidate = 3
+Set dijkstra.distances.C = 3
+Pushed (3, 'C') onto queue
+dijkstra.neighbour = 'D'
+dijkstra.weight = 5
+dijkstra.candidate = 6
+Set dijkstra.distances.D = 6
+Pushed (6, 'D') onto queue
+Popped (3, 'C') from queue
+dijkstra.distance = 3
+dijkstra.node = 'C'
+Added C to visited
+dijkstra.weight = 1
+dijkstra.candidate = 4
+Set dijkstra.distances.D = 4
+Pushed (4, 'D') onto queue
+Popped (4, 'C') from queue
+dijkstra.distance = 4
+Popped (4, 'D') from queue
+dijkstra.node = 'D'
+Added D to visited
+Popped (6, 'D') from queue
+dijkstra.distance = 6
+dijkstra({'A': {'B': 1, 'C': 4}, 'B': {'C': 2, 'D': 5}, 'C': {'D': 1}, 'D': {}}, 'A') returned {'A': 0, 'B': 1, 'C': 3, 'D': 4}
+
+--- Breadth-first search with a deque ---
+Calling breadth_first({'A': {'B': 1, 'C': 4}, 'B': {'C': 2, 'D': 5}, 'C': {'D': 1}, 'D': {}}, 'A')
+Defined breadth_first.graph = {'A': {'B': 1, 'C': 4}, 'B': {'C': 2, 'D': 5}, 'C': {'D': 1}, 'D': {}}
+Defined breadth_first.start = 'A'
+Defined breadth_first.order = []
+Defined breadth_first.frontier = deque(['A'])
+Defined breadth_first.seen = {'A'}
+Popped A from frontier
+Defined breadth_first.node = 'A'
+Added A to the end of order
+Defined breadth_first.neighbour = 'B'
+Added B to seen
+Added B to frontier
+breadth_first.neighbour = 'C'
+Added C to seen
+Added C to frontier
+Popped B from frontier
+breadth_first.node = 'B'
+Added B to the end of order
+breadth_first.neighbour = 'D'
+Added D to seen
+Added D to frontier
+Popped C from frontier
+breadth_first.node = 'C'
+Added C to the end of order
+Popped D from frontier
+breadth_first.node = 'D'
+Added D to the end of order
+breadth_first({'A': {'B': 1, 'C': 4}, 'B': {'C': 2, 'D': 5}, 'C': {'D': 1}, 'D': {}}, 'A') returned ['A', 'B', 'C', 'D']

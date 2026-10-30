@@ -1,8 +1,13 @@
+from __future__ import annotations
+
 import os
 import time
 import threading
 
-from typing import Callable, Literal, TypeAlias
+from typing import TYPE_CHECKING, Callable, Literal, Optional, Tuple
+
+if TYPE_CHECKING:
+	from typing_extensions import TypeAlias
 
 PathMode: TypeAlias = Literal["absolute", "project", "file"]
 
@@ -51,19 +56,20 @@ class _ThreadState(threading.local):
 	filepath: str | None = None
 
 	# level= / filter= of the enclosing @log, asked before change tracking emits
-	emit_gate: "Callable[[str, str], bool] | None" = None
+	emit_gate: Callable[[str, str], bool] | None = None
 
 
 _tls: _ThreadState = _ThreadState()
 
 # What _push_display saves and _pop_display restores
-DisplayState: TypeAlias = tuple[
-	Mode | None,
-	bool | None,
-	bool | None,
-	bool | None,
-	str | None,
-	"Callable[[str, str], bool] | None",
+# typing.Tuple / Optional, not tuple[...] / X | None, so 3.8 can evaluate it
+DisplayState: TypeAlias = Tuple[
+	Optional[Mode],
+	Optional[bool],
+	Optional[bool],
+	Optional[bool],
+	Optional[str],
+	Optional[Callable[[str, str], bool]],
 ]
 
 
@@ -87,9 +93,7 @@ def _show_lineno() -> bool:
 	return _g_show_lineno if override is None else override
 
 
-EmitContext: TypeAlias = tuple[
-	bool, bool, bool, str | None, "Callable[[str, str], bool] | None"
-]
+EmitContext: TypeAlias = Tuple[bool, bool, bool, Optional[str], Optional[Callable[[str, str], bool]]]
 
 
 def _emit_context(
@@ -123,7 +127,7 @@ def _push_display(
 	show_file: bool | None = None,
 	show_lineno: bool | None = None,
 	filepath: str | None = None,
-	emit_gate: "Callable[[str, str], bool] | None" = None,
+	emit_gate: Callable[[str, str], bool] | None = None,
 ) -> DisplayState:
 	"""Install per-call overrides; pair with _pop_display in a finally"""
 
@@ -242,23 +246,23 @@ def _normalize_mode(mode: Mode) -> Mode:
 
 
 __all__ = [
+	"DisplayState",
 	"Mode",
 	"PathMode",
-	"DisplayState",
-	"toggle_logs",
-	"toggle_global_log_file",
-	"toggle_message_metadata",
-	"toggle_decorator_log_only",
-	"set_mode",
-	"set_path_mode",
-	"set_global_log_file",
+	"_emit_context",
 	"_mode",
-	"_show_time",
+	"_normalize_mode",
+	"_pop_display",
+	"_push_display",
+	"_reset_display",
 	"_show_file",
 	"_show_lineno",
-	"_emit_context",
-	"_push_display",
-	"_pop_display",
-	"_reset_display",
-	"_normalize_mode",
+	"_show_time",
+	"set_global_log_file",
+	"set_mode",
+	"set_path_mode",
+	"toggle_decorator_log_only",
+	"toggle_global_log_file",
+	"toggle_logs",
+	"toggle_message_metadata",
 ]

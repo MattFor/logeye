@@ -1,4 +1,0 @@
-[0.016s] demo_file_and_filter.py:104 (set) process.queue = []
-[0.016s] demo_file_and_filter.py:105 (change) process.queue.append(1) -> [1]
-[0.016s] demo_file_and_filter.py:106 (change) process.queue.append(2) -> [1, 2]
-[0.016s] demo_file_and_filter.py:107 (change) process.queue.pop(0) -> 1 | [2]

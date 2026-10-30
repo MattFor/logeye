@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import os
 import sys
+import threading
 
 from numbers import Real
 from types import CodeType, FrameType
@@ -12,22 +14,22 @@ from typing import (
 	Literal,
 	SupportsFloat,
 	SupportsIndex,
-	TypeAlias,
-	TypeGuard,
 	TypeVar,
 	cast,
 )
 
-from logeye.emmiter import _emit
-from logeye.introspection import _line_assigns
-
-# Events sys.settrace dispatches
-TraceEvent: TypeAlias = Literal["call", "line", "return", "exception", "opcode"]
+from logeye.emitter import _emit
+from logeye.introspection import _is_library_file, _line_assigns, _line_may_mutate
+from logeye.introspection.frames import _is_external_code
 
 if TYPE_CHECKING:
 	from _typeshed import TraceFunction
+	from typing_extensions import TypeAlias, TypeGuard
 
 	from .core import Kind
+
+# Events sys.settrace dispatches
+TraceEvent: TypeAlias = Literal["call", "line", "return", "exception", "opcode"]
 
 _NO_VALUE: object = object()
 
@@ -72,6 +74,44 @@ _g_watch_meta: dict[CodeType, dict[str, dict[str, object]]] = {}
 # frame -> last line seen; dropped on return so frames are not retained
 _g_last_line: dict[FrameType, int] = {}
 
+# frame -> the local trace function the chained tracer handed back for it
+_g_chained_locals: dict[FrameType, TraceFunction] = {}
+
+# Coverage tools cannot see code that runs inside a trace function: the interpreter
+# switches tracing off there. The test suite sets this to measure logeye's own tracers,
+# whose bodies then run through sys.call_tracing, which switches it back on
+_MEASURE_TRACERS = bool(os.environ.get("LOGEYE_MEASURE_TRACERS"))
+
+R = TypeVar("R")
+
+
+# Set while a measured trace body runs on this thread
+_measuring = threading.local()
+
+
+def _measurable(
+	trace: Callable[[FrameType, str, object], R],
+) -> Callable[[FrameType, str, object], R]:
+	if not _MEASURE_TRACERS:
+		return trace
+
+	def measured(frame: FrameType, event: str, arg: object) -> R:
+		# Only events from user code are measured, and not those a measured body sets
+		# off: it runs with tracing back on, so logeye's own frames, the stdlib and a
+		# chained tracer all report here, and through sys.call_tracing again would
+		# recurse without end
+		filename = frame.f_code.co_filename
+		if getattr(_measuring, "active", False) or _is_library_file(filename) or _is_external_code(filename):
+			return trace(frame, event, arg)
+
+		_measuring.active = True
+		try:
+			return sys.call_tracing(trace, (frame, event, arg))
+		finally:
+			_measuring.active = False
+
+	return measured
+
 
 def _mark_emitted(frame: FrameType, name: str) -> None:
 	if not name:
@@ -83,10 +123,10 @@ def _mark_emitted(frame: FrameType, name: str) -> None:
 	_recently_emitted[(frame.f_code, name)] = frame.f_lineno
 
 
-def _watched_names(code: CodeType) -> set[str] | None:
-	"""Names an explicit watch() / `| l` reports in this code"""
+def _watch_threshold(code: CodeType, name: str) -> object | None:
+	"""The threshold watch(..., threshold=) registered for `name` in this code"""
 
-	return _g_watched_names.get(code)
+	return _g_watch_meta.get(code, {}).get(name, {}).get("threshold")
 
 
 def _was_just_emitted(code: CodeType, name: str, lineno: int | None) -> bool:
@@ -95,9 +135,7 @@ def _was_just_emitted(code: CodeType, name: str, lineno: int | None) -> bool:
 	return lineno is not None and _recently_emitted.get((code, name)) == lineno
 
 
-def _mark_watched(
-	frame: FrameType, name: str, *, threshold: object | None = None
-) -> None:
+def _mark_watched(frame: FrameType, name: str, *, threshold: object | None = None) -> None:
 	if not name or name == "_":
 		return
 
@@ -182,9 +220,7 @@ def _normalize_threshold_spec(spec: object) -> dict[str, float]:
 
 		return out
 
-	raise TypeError(
-		"threshold must be a number, a ('absolute'|'relative', value) tuple, or a mapping!"
-	)
+	raise TypeError("threshold must be a number, a ('absolute'|'relative', value) tuple, or a mapping!")
 
 
 def _resolve_threshold_for_name(
@@ -243,9 +279,7 @@ def _differs(old: object, new: object) -> bool:
 	return True
 
 
-def _passes_threshold(
-	old: object, new: object, threshold: dict[str, float] | None
-) -> bool:
+def _passes_threshold(old: object, new: object, threshold: dict[str, float] | None) -> bool:
 	if old is _NO_VALUE:
 		return True
 
@@ -272,21 +306,54 @@ def _passes_threshold(
 	return _differs(old, new)
 
 
-def _global_tracer(frame: FrameType, event: str, arg: object) -> TraceFunction | None:
+def _forward(frame: FrameType, event: str, arg: object) -> None:
+	"""
+	Keep whatever tracer was installed before ours (pdb, coverage) working: it gets
+	every "call", and the local trace function it asks for gets that frame's events
+	"""
+
+	# `event` is str so this also fits frame.f_trace, typed loosely
+	trace_event = cast("TraceEvent", event)
+
+	if event == "call":
+		previous = _g_previous_trace
+		if previous is None:
+			return
+
+		try:
+			# noinspection PyCallingNonCallable
+			local = previous(frame, trace_event, arg)
+		except Exception:
+			local = None
+
+		if local is not None:
+			_g_chained_locals[frame] = local
+
+		return
+
+	local = _g_chained_locals.get(frame)
+	if local is None:
+		return
+
+	try:
+		following = local(frame, trace_event, arg)
+	except Exception:
+		following = None
+
+	if following is None or event == "return":
+		_ = _g_chained_locals.pop(frame, None)
+	else:
+		_g_chained_locals[frame] = following
+
+
+def _global_trace(frame: FrameType, event: str, arg: object) -> TraceFunction | None:
 	"""Line tracer for names registered through watch() / log()"""
 
-	previous = _g_previous_trace
-	if previous is not None:
-		try:
-			# `event` is str so this also fits frame.f_trace, typed loosely
-			# noinspection PyCallingNonCallable
-			_ = previous(frame, cast("TraceEvent", event), arg)
-		except Exception:
-			pass
+	_forward(frame, event, arg)
 
 	watched = _g_watched_names.get(frame.f_code)
 	if not watched:
-		return None
+		return _global_tracer if frame in _g_chained_locals else None
 
 	if event not in ("line", "return"):
 		return _global_tracer
@@ -315,6 +382,13 @@ def _global_tracer(frame: FrameType, event: str, arg: object) -> TraceFunction |
 		value = current[name]
 		old = last.get(name, _NO_VALUE)
 
+		# A logging container reports its own changes; C code like heapq goes around them
+		resync = getattr(type(value), "_logeye_resync", None) if old is value else None
+		if callable(resync):
+			if _line_may_mutate(filename, lineno, name):
+				_ = resync(value, filename, lineno, name)
+			continue
+
 		differs = old is not _NO_VALUE and _differs(old, value)
 
 		kind: Kind
@@ -328,9 +402,7 @@ def _global_tracer(frame: FrameType, event: str, arg: object) -> TraceFunction |
 		else:
 			continue
 
-		threshold = _resolve_threshold_for_name(
-			name, (meta or {}).get(name, {}).get("threshold")
-		)
+		threshold = _resolve_threshold_for_name(name, (meta or {}).get(name, {}).get("threshold"))
 
 		if differs:
 			if not _passes_threshold(old, value, threshold):
@@ -344,24 +416,34 @@ def _global_tracer(frame: FrameType, event: str, arg: object) -> TraceFunction |
 	return _global_tracer
 
 
+_global_tracer = _measurable(_global_trace)
+
+
+def _is_call_tracer(trace: object) -> bool:
+	"""Is `trace` the tracer of a @log call in progress? That call restores the trace itself"""
+
+	code = getattr(trace, "__code__", None)
+
+	return trace is not _global_tracer and isinstance(code, CodeType) and _is_library_file(code.co_filename)
+
+
 def _install_global_trace(frame: FrameType | None = None) -> None:
 	global _g_trace_installed, _g_previous_trace
 
-	if not _g_trace_installed:
-		existing = sys.gettrace()
+	current = sys.gettrace()
 
-		if existing is not _global_tracer:
-			_g_previous_trace = existing
-
-		sys.settrace(_global_tracer)
-		_g_trace_installed = True
-	elif sys.gettrace() is not _global_tracer:
-		# Something replaced this, restore without losing the original
+	# A @log call in progress reports its own frames, watched names included
+	if current is not _global_tracer and not _is_call_tracer(current):
+		# Whatever was there keeps working through _forward, and comes back on uninstall
+		_g_previous_trace = current
 		sys.settrace(_global_tracer)
 
-	# Frames already on the stack predate settrace and need f_trace set manually
+	_g_trace_installed = True
+
+	# Frames already on the stack predate settrace and need f_trace set by hand,
+	# unless something (a @log call, a debugger) traces them already
 	while frame is not None:
-		if frame.f_code in _g_watched_names:
+		if frame.f_trace is None and frame.f_code in _g_watched_names:
 			frame.f_trace = _global_tracer
 
 			_ = _g_last_line.setdefault(frame, frame.f_lineno)
@@ -391,21 +473,23 @@ def _reset_watch_state() -> None:
 	_g_last_seen.clear()
 	_g_watch_meta.clear()
 	_g_last_line.clear()
+	_g_chained_locals.clear()
 	_recently_emitted.clear()
 
 
 __all__ = [
 	"TraceEvent",
-	"_mark_emitted",
-	"_watched_names",
-	"_was_just_emitted",
-	"_mark_watched",
 	"_differs",
-	"_passes_threshold",
-	"_recently_emitted",
-	"_resolve_threshold_for_name",
 	"_global_tracer",
 	"_install_global_trace",
-	"_uninstall_global_trace",
+	"_mark_emitted",
+	"_mark_watched",
+	"_measurable",
+	"_passes_threshold",
+	"_recently_emitted",
 	"_reset_watch_state",
+	"_resolve_threshold_for_name",
+	"_uninstall_global_trace",
+	"_was_just_emitted",
+	"_watch_threshold",
 ]

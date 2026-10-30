@@ -1,0 +1,53 @@
+--- Every local variable, as it changes ---
+(call) total args=(3, 4)
+(set) total.a = 3
+(set) total.b = 4
+(set) total.result = 7
+(change) total.result = 14
+(change) total.result = 19
+(return) total args=(3, 4) -> 19
+
+--- Recursion: each level gets its own number ---
+(call) factorial args=(4)
+(set) factorial.n = 4
+(call) factorial#2 args=(3)
+(set) factorial#2.n = 3
+(call) factorial#3 args=(2)
+(set) factorial#3.n = 2
+(call) factorial#4 args=(1)
+(set) factorial#4.n = 1
+(return) factorial#4 args=(1) -> 1
+(return) factorial#3 args=(2) -> 2
+(return) factorial#2 args=(3) -> 6
+(return) factorial args=(4) -> 24
+
+--- Functions defined inside are traced as well ---
+(call) hypotenuse args=(3, 4)
+(set) hypotenuse.a = 3
+(set) hypotenuse.b = 4
+(call) hypotenuse.square
+(set) hypotenuse.square(v=3)
+(set) hypotenuse.square.v = 3
+(return) hypotenuse.square args=(3) -> 9
+(call) hypotenuse.square
+(set) hypotenuse.square(v=4)
+(set) hypotenuse.square.v = 4
+(return) hypotenuse.square args=(4) -> 16
+(return) hypotenuse args=(3, 4) -> 5.0
+
+--- Generators: every value yielded, and the final return ---
+(call) countdown args=(3)
+(set) countdown.n = 3
+(yield) countdown args=(3) -> 3
+(change) countdown.n = 2
+(yield) countdown args=(3) -> 2
+(change) countdown.n = 1
+(yield) countdown args=(3) -> 1
+(change) countdown.n = 0
+(return) countdown args=(3) -> 'liftoff'
+
+--- An exception is reported where it leaves the function ---
+(call) parse_age args=('forty')
+(set) parse_age.text = 'forty'
+(raise) parse_age args=('forty') -! ValueError: invalid literal for int() with base 10: 'forty'
+...and the ValueError still reaches the caller

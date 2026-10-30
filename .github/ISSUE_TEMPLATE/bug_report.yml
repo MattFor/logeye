@@ -1,0 +1,36 @@
+name: Bug report
+description: LogEye logged something wrong, crashed, or changed what your program does
+labels: [bug]
+body:
+  - type: textarea
+    id: code
+    attributes:
+      label: Minimal code
+      description: The smallest script that shows the problem.
+      render: python
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: What LogEye printed
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected
+    validations:
+      required: true
+  - type: input
+    id: versions
+    attributes:
+      label: Versions
+      description: Output of `python -c "import sys, importlib.metadata as m; print(sys.version, m.version('logeye'))"`
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: Operating system

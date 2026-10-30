@@ -1,70 +1,107 @@
 [build-system]
-requires = ["setuptools>=77.0.3", "wheel"]
-build-backend = "setuptools.build_meta"
+# hatchling: builds on every supported Python, 3.8 included, and reads SPDX licenses
+requires = ["hatchling>=1.27", "hatch-vcs"]
+build-backend = "hatchling.build"
 
 [project]
 name = "logeye"
-version = "1.6.2"
+# From the git tag: pushing v1.7.0 releases 1.7.0, nothing to bump by hand
+dynamic = ["version"]
 description = "Frictionless runtime logging for Python variables and functions"
 readme = "README.md"
-requires-python = ">=3.10"
-
-authors = [
-    { name = "MattFor", email = "mattfor@relaxy.xyz" }
-]
-
-license = { file = "LICENSE" }
-
+requires-python = ">=3.8"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "MattFor", email = "mattfor@relaxy.xyz" }]
+keywords = ["logging", "debugging", "tracing", "education", "print-debugging", "algorithms"]
 classifiers = [
-    "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.10",
-    "Programming Language :: Python :: 3.11",
-    "Programming Language :: Python :: 3.12",
-    "Programming Language :: Python :: 3.13",
-    "Programming Language :: Python :: 3.14",
-    "License :: OSI Approved :: MIT License",
-    "Operating System :: OS Independent",
+	"Development Status :: 5 - Production/Stable",
+	"Intended Audience :: Developers",
+	"Intended Audience :: Education",
+	"Operating System :: OS Independent",
+	"Programming Language :: Python :: 3",
+	"Programming Language :: Python :: 3 :: Only",
+	"Programming Language :: Python :: 3.8",
+	"Programming Language :: Python :: 3.9",
+	"Programming Language :: Python :: 3.10",
+	"Programming Language :: Python :: 3.11",
+	"Programming Language :: Python :: 3.12",
+	"Programming Language :: Python :: 3.13",
+	"Programming Language :: Python :: 3.14",
+	"Programming Language :: Python :: Implementation :: CPython",
+	"Topic :: Software Development :: Debuggers",
+	"Topic :: System :: Logging",
+	"Typing :: Typed",
 ]
-
 dependencies = []
 
 [project.urls]
 Homepage = "https://github.com/MattFor/logeye"
+Source = "https://github.com/MattFor/logeye"
+Issues = "https://github.com/MattFor/logeye/issues"
+Changelog = "https://github.com/MattFor/logeye/blob/master/CHANGELOG.md"
 
-[tool.setuptools.packages.find]
-where = ["."]
-include = ["logeye*"]
+[tool.hatch.version]
+source = "vcs"
+
+[tool.hatch.build.targets.sdist]
+include = ["logeye", "tests", "demos", "CHANGELOG.md"]
 
 [dependency-groups]
+test = ["pytest>=8", "numpy"]
+# sys.monitoring, which can measure logeye's tracers, arrived in 3.12
+coverage = ["coverage>=7.10; python_version >= '3.12'"]
 dev = [
-    "ruff",
-    "basedpyright",
-    "pytest>=9.0.2"
+	{ include-group = "test" },
+	{ include-group = "coverage" },
+	"ruff",
+	"basedpyright",
+	# Only imported under TYPE_CHECKING, for 3.8-safe typing names
+	"typing_extensions",
 ]
 
+[tool.uv]
+# The version comes from git: rebuild the local install when commits or tags change
+cache-keys = [{ file = "pyproject.toml" }, { git = { commit = true, tags = true } }]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = ["-ra", "--strict-markers"]
+
+[tool.coverage.run]
+source = ["logeye"]
+# The demos run in subprocesses
+patch = ["subprocess"]
+
+[tool.coverage.report]
+fail_under = 90
+show_missing = true
+skip_covered = true
+exclude_also = ["if TYPE_CHECKING:", "@overload", "raise NotImplementedError"]
+
 [tool.ruff]
-line-length = 90
-indent-width = 4
+line-length = 120
+target-version = "py38"
 
 [tool.ruff.format]
 indent-style = "tab"
-quote-style = "double"
-line-ending = "auto"
+quote-style = "preserve"
 skip-magic-trailing-comma = false
 
 [tool.ruff.lint]
-select = ["E4", "E7", "E9", "F"]
+select = ["E4", "E7", "E9", "F", "B", "C4", "PIE", "SIM", "UP", "ARG", "PLE", "PLW", "FURB", "RUF"]
 
 [tool.ruff.lint.per-file-ignores]
-"demos/*" = ["E731", "F841"]
-"tests/*" = ["E731", "F841"]
-
-[tool.ruff.lint.pycodestyle]
-max-line-length = 90
+# Module-level settings, the cached formatter and the installed tracer are globals on purpose
+"logeye/{config,formatting,watcher}.py" = ["PLW0603"]
+# Demos and tests are what logeye traces: their code shapes are the input, so only E and F apply
+"{demos,tests}/*" = ["E731", "F841", "B", "C4", "PIE", "SIM", "UP", "ARG", "PLW", "FURB", "RUF"]
 
 [tool.basedpyright]
 include = ["logeye"]
 exclude = ["tests", "demos"]
+# The oldest supported version, so a 3.9+ only API is caught before a user hits it
+pythonVersion = "3.8"
 
 reportPrivateUsage = false # We'll deal with this later methinks
 reportImportCycles = false

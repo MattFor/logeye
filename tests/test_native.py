@@ -136,11 +136,16 @@ def test_array_like_threshold_falls_back_to_change_detection(capsys):
 
 
 def test_logged_object_equality_survives_an_elementwise_payload():
-	wrapped = _wrap_value(FrameLike([1, 2]), name="frame")
+	wrapped = LoggedObject(FrameLike([1, 2]), name="frame")
 
-	assert isinstance(wrapped, LoggedObject)
 	assert wrapped == FrameLike([1, 2])
 	assert wrapped != FrameLike([1, 9])
+
+
+def test_plain_objects_are_never_swapped_for_a_stand_in():
+	frame = FrameLike([1, 2])
+
+	assert _wrap_value(frame, name="frame") is frame
 
 
 def test_builtin_logs_call_and_return(capsys):

@@ -1,0 +1,95 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+  # The release workflow runs this first, so nothing untested is published
+  workflow_call:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: Lint and type-check
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v6
+      - name: Format
+        run: uv run ruff format --check .
+      - name: Lint
+        run: uv run ruff check .
+      - name: Type-check (against Python 3.8)
+        run: uv run basedpyright
+      - name: Prettier
+        run: npx --yes prettier@3.9.6 --check .
+
+  test:
+    name: Test (Python ${{ matrix.python }}, ${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-14, windows-2022]
+        python: ['3.8', '3.9', '3.10', '3.11', '3.12', '3.13', '3.14']
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Test, demos included
+        run: uv run --no-default-groups --group test pytest
+
+  coverage:
+    name: Coverage
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: '3.14'
+      - name: Measure, demos included
+        env:
+          # sys.monitoring sees code that runs inside logeye's trace functions once
+          # LOGEYE_MEASURE_TRACERS turns tracing back on there (watcher._measurable)
+          COVERAGE_CORE: sysmon
+          LOGEYE_MEASURE_TRACERS: '1'
+        run: uv run --no-default-groups --group test --group coverage coverage run -m pytest
+      - name: Report (fails under the threshold in pyproject.toml)
+        shell: bash
+        run: |
+          uv run --no-default-groups --group coverage coverage combine
+          uv run --no-default-groups --group coverage coverage report --format=markdown >> "$GITHUB_STEP_SUMMARY"
+          uv run --no-default-groups --group coverage coverage report
+
+  package:
+    name: Build and smoke-test the package
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # The version comes from the latest tag
+          fetch-depth: 0
+      - uses: astral-sh/setup-uv@v6
+      - name: Build
+        run: uv build
+      - name: Check metadata
+        run: uvx twine check --strict dist/*
+      - name: Import the built wheel on the oldest and newest Python
+        shell: bash
+        run: |
+          for python in 3.8 3.14; do
+            uv run --isolated --no-project --python "$python" --with dist/*.whl \
+              python -c "import logeye; assert logeye.log(41) + 1 == 42"
+          done
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dist
+          path: dist/*

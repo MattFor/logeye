@@ -2,26 +2,43 @@ from __future__ import annotations
 
 import sys
 import inspect
+import contextlib
 import warnings
 import functools
 
 from types import CellType, CodeType, FrameType
+from collections import deque
 from dataclasses import dataclass
-from collections.abc import Callable, Generator, Iterable, Mapping
-from typing import TYPE_CHECKING, Literal, TypeVar, ParamSpec, cast, overload
+from collections.abc import (
+	AsyncGenerator,
+	Awaitable,
+	Callable,
+	Generator,
+	Iterable,
+	Mapping,
+)
+from typing import TYPE_CHECKING, Dict, Literal, TypeVar, cast, overload
 
 from . import config
-from .emmiter import _emit
-from .formatting import _format_message, _path
+from .emitter import _emit
+from .formatting import _path, _safe_repr
 from .introspection.ast import (
+	_observed_call,
+	_comprehension_variables,
+	_fresh_binding,
+	_get_constructed_target,
+	_line_may_mutate,
 	_infer_name_from_frame,
 	_get_assignment_target_for_call,
 )
-from .introspection.templates import _expand_template
+from .introspection.templates import _expand_template, _format_message
 from .wrappers import (
+	_OPAQUE_TYPES,
+	_BaseLogged,
+	_unwrap_value,
 	_wrap_value,
-	LoggedSet,
-	LoggedList,
+	_wrap_assigned,
+	_observed_change,
 	LoggedDict,
 	LoggedObject,
 )
@@ -36,15 +53,20 @@ from .watcher import (
 	_mark_emitted,
 	_mark_watched,
 	_passes_threshold,
-	_watched_names,
+	_watch_threshold,
 	_was_just_emitted,
+	_measurable,
 	_install_global_trace,
 	_resolve_threshold_for_name,
 )
 
 if TYPE_CHECKING:
 	from _typeshed import TraceFunction
+	from typing_extensions import ParamSpec
+
 	from .config import Mode
+
+	P = ParamSpec("P")
 
 _NO_VALUE: object = object()
 
@@ -57,6 +79,10 @@ class _CallState:
 	name: str
 	signature: str
 	should_emit: Callable[[str, str], bool]
+
+	# Arguments as displayed: a method's self / cls left out
+	args: tuple[object, ...]
+	kwargs: dict[str, object]
 
 	# Line the frame last stopped on, filled in as a generator suspends
 	exit_line: int | None = None
@@ -72,16 +98,87 @@ class _CallState:
 T = TypeVar("T")
 K = TypeVar("K")
 V = TypeVar("V")
-P = ParamSpec("P")
 
 Level = Literal["call", "state", "full"]
 Kind = Literal["change", "message", "set", "call", "return", "raise", "yield"]
 
-# Not user logic
-_SKIPPED_NESTED_NAMES = frozenset({"currentframe", "abspath", "join", "parse"})
+# Not user logic; comprehensions are their own frames before 3.12
+_SKIPPED_NESTED_NAMES = frozenset(
+	{
+		"currentframe",
+		"abspath",
+		"join",
+		"parse",
+		"<listcomp>",
+		"<setcomp>",
+		"<dictcomp>",
+		"<genexpr>",
+	}
+)
 
-# Set on C types, which reject attribute assignment
+# C types reject attribute assignment: 3.10+ flags them immutable, and before
+# that only heap types (classes created at runtime) could be patched at all
 _Py_TPFLAGS_IMMUTABLETYPE = 1 << 8
+_Py_TPFLAGS_HEAPTYPE = 1 << 9
+
+# Values a local is compared against a snapshot of, to see changes made in place
+_CONTAINERS = (list, dict, set)
+
+# Code that suspends and resumes on an event loop's schedule rather than its caller's
+_ASYNC_CODE = inspect.CO_COROUTINE | inspect.CO_ASYNC_GENERATOR | inspect.CO_ITERABLE_COROUTINE
+
+
+class _Driven:
+	"""Makes a driver generator awaitable from an async def"""
+
+	__slots__: tuple[str, ...] = ("_steps",)
+
+	def __init__(self, steps: Generator[object, object, object]) -> None:
+		self._steps: Generator[object, object, object] = steps
+
+	def __await__(self) -> Generator[object, object, object]:
+		return self._steps
+
+
+class _Attributes(Dict[str, object]):
+	"""Snapshot of a plain object's public attributes, diffed one attribute at a time"""
+
+
+def _comparable(value: object) -> object:
+	"""A deque is compared as a list; the two never compare equal"""
+
+	# noinspection PyUnnecessaryCast
+	return list(cast("deque[object]", value)) if isinstance(value, deque) else value
+
+
+def _snapshot(value: object) -> object:
+	"""A plain copy to diff `value` against later; _NO_VALUE when it reports itself"""
+
+	if isinstance(value, _BaseLogged):
+		return _NO_VALUE
+
+	if isinstance(value, _CONTAINERS):
+		return _unwrap_value(cast(object, value))
+
+	if isinstance(value, deque):
+		# Kept as a list, which is what a deque is compared as; the two never compare equal
+		# noinspection PyUnnecessaryCast
+		return [_unwrap_value(item) for item in cast("deque[object]", value)]
+
+	attributes = getattr(value, "__dict__", None)
+
+	if (
+		type(attributes) is dict
+		and not callable(value)
+		and not isinstance(value, _OPAQUE_TYPES)
+		# A @log class reports its own attributes
+		and not getattr(type(value).__setattr__, "_logeye_patched", False)
+	):
+		# noinspection PyUnnecessaryCast
+		items = cast("dict[str, object]", attributes).items()
+		return _Attributes({k: _unwrap_value(v) for k, v in items if not k.startswith("_")})
+
+	return _NO_VALUE
 
 
 def _resolve_filepath(file: str | None = None, filepath: str | None = None) -> str | None:
@@ -171,9 +268,10 @@ def _instance_label(instance: object) -> str:
 
 
 def _is_patchable(cls: type) -> bool:
-	"""C types carry Py_TPFLAGS_IMMUTABLETYPE and reject attribute assignment"""
+	"""Can attributes be assigned on `cls`? C types refuse"""
 
-	return not cls.__flags__ & _Py_TPFLAGS_IMMUTABLETYPE
+	flags = cls.__flags__
+	return bool(flags & _Py_TPFLAGS_HEAPTYPE) and not flags & _Py_TPFLAGS_IMMUTABLETYPE
 
 
 def _user_stacklevel() -> int:
@@ -223,40 +321,45 @@ def _log_class(
 		return cls
 
 	original_init = cast("Callable[..., None]", cls.__init__)
-	original_setattr = cast(
-		"Callable[[object, str, object], None]", cast(object, cls.__setattr__)
-	)
-	original_delattr = cast(
-		"Callable[[object, str], None]", cast(object, cls.__delattr__)
-	)
+	original_setattr = cast("Callable[[object, str, object], None]", cast(object, cls.__setattr__))
+	original_delattr = cast("Callable[[object, str], None]", cast(object, cls.__delattr__))
 
 	qualname = cls.__qualname__.replace(".<locals>.", ".")
 
 	# __slots__ classes have nowhere to park the display name
 	supports_instance_dict = any(
-		"__dict__" in vars(base) or "__slots__" not in vars(base)
-		for base in cls.__mro__
-		if base is not object
+		"__dict__" in vars(base) or "__slots__" not in vars(base) for base in cls.__mro__ if base is not object
 	)
+
+	def _run_init(self: object, args: tuple[object, ...], kwargs: dict[str, object]) -> None:
+		if original_init is not object.__init__:
+			original_init(self, *args, **kwargs)
+		# Patching __init__ stops object.__new__ rejecting arguments; reject them here
+		elif (args or kwargs) and type(self).__new__ is object.__new__:
+			raise TypeError(f"{type(self).__qualname__}() takes no arguments")
+		else:
+			# Whatever __new__ consumed them; object.__init__ would now refuse them
+			original_init(self)
 
 	@functools.wraps(original_init)
 	def __init__(self: object, *args: object, **kwargs: object) -> None:
 		if not config._g_enabled:
-			original_init(self, *args, **kwargs)
+			_run_init(self, args, kwargs)
 			return
 
 		call_frame = _caller_frame()
 		call_filename, call_lineno = _get_location(call_frame)
 
+		# `x = log(Foo())`, then `x = Foo()`, then the class name
 		instance_name = (
-			_get_assignment_target_for_call(call_frame) or type(self).__name__.lower()
+			_get_assignment_target_for_call(call_frame)
+			or _get_constructed_target(call_frame, type(self).__name__)
+			or type(self).__name__.lower()
 		)
 
 		if supports_instance_dict:
-			try:
+			with contextlib.suppress(AttributeError):
 				object.__setattr__(self, "_logeye_name", instance_name)
-			except AttributeError:
-				pass
 
 		previous = config._push_display(mode, show_time, show_file, show_lineno, filepath)
 
@@ -282,23 +385,19 @@ def _log_class(
 		finally:
 			config._pop_display(previous)
 
-		original_init(self, *args, **kwargs)
+		_run_init(self, args, kwargs)
 
 	def __setattr__(self: object, name: str, value: object) -> None:
+		if not config._g_enabled or name == "_logeye_name":
+			original_setattr(self, name, value)
+			return
+
 		is_private = name.startswith("_")
 		instance_name = _instance_label(self)
 
 		already_exists = name in getattr(self, "__dict__", ())
 
-		if value is self:
-			wrapped = value
-		else:
-			wrapped = _wrap_value(value, name=f"{instance_name}.{name}")
-
-		original_setattr(self, name, wrapped)
-
-		if not config._g_enabled or is_private and name == "_logeye_name":
-			return
+		original_setattr(self, name, _wrap_assigned(value, f"{instance_name}.{name}"))
 
 		frame = _caller_frame()
 		try:
@@ -310,9 +409,7 @@ def _log_class(
 
 			kind = "change" if already_exists else "set"
 
-			previous = config._push_display(
-				mode, show_time, show_file, show_lineno, filepath
-			)
+			previous = config._push_display(mode, show_time, show_file, show_lineno, filepath)
 
 			try:
 				_emit(
@@ -346,9 +443,7 @@ def _log_class(
 		try:
 			filename, lineno = _get_location(frame)
 
-			previous = config._push_display(
-				mode, show_time, show_file, show_lineno, filepath
-			)
+			previous = config._push_display(mode, show_time, show_file, show_lineno, filepath)
 
 			try:
 				_emit(
@@ -381,9 +476,17 @@ def _log_class(
 		show_lineno=show_lineno,
 	)
 
-	setattr(cls, "__init__", __init__)
-	setattr(cls, "__setattr__", __setattr__)
-	setattr(cls, "__delattr__", __delattr__)
+	for attr, patched in (
+		("__init__", __init__),
+		("__setattr__", __setattr__),
+		("__delattr__", __delattr__),
+	):
+		# Inherited from a @log base, which already reports it; a second layer would double up
+		if getattr(cast(object, getattr(cls, attr)), "_logeye_patched", False):
+			continue
+
+		setattr(patched, "_logeye_patched", True)  # noqa: B010 -- not an attribute of the function's type
+		setattr(cls, attr, patched)
 
 	return cls
 
@@ -527,11 +630,9 @@ def watch(
 
 
 # Helpers
-def _format_call_signature(
-	name: str, args: tuple[object, ...], kwargs: Mapping[str, object]
-) -> str:
-	arg_parts = [", ".join(repr(a) for a in args)] if args else []
-	kw_parts = [", ".join(f"{k}={v!r}" for k, v in kwargs.items())] if kwargs else []
+def _format_call_signature(name: str, args: tuple[object, ...], kwargs: Mapping[str, object]) -> str:
+	arg_parts = [", ".join(_safe_repr(a) for a in args)] if args else []
+	kw_parts = [", ".join(f"{k}={_safe_repr(v)}" for k, v in kwargs.items())] if kwargs else []
 	joined = ", ".join([p for p in arg_parts + kw_parts if p])
 	return f"{name}({joined})"
 
@@ -618,11 +719,10 @@ def _log_function(
 	raw_code = cast(object, getattr(target_func, "__code__", None))
 	target_code = raw_code if isinstance(raw_code, CodeType) else None
 
-	is_method_like = bool(
-		target_code
-		and target_code.co_varnames
-		and target_code.co_varnames[0] in {"self", "cls"}
-	)
+	is_method_like = bool(target_code and target_code.co_varnames and target_code.co_varnames[0] in {"self", "cls"})
+
+	# Called with self / cls first; a bound method was handed it already
+	takes_self = is_method_like and not inspect.ismethod(cast(object, func))
 
 	# noinspection PyUnnecessaryCast
 	qualname = cast(object, getattr(target_func, "__qualname__", None))
@@ -639,9 +739,10 @@ def _log_function(
 		allowed_codes = {target_code} if target_code is not None else set()
 
 	is_generator = inspect.isgeneratorfunction(target_func)
-	is_async = inspect.iscoroutinefunction(target_func) or inspect.isasyncgenfunction(
-		target_func
-	)
+	is_async = inspect.iscoroutinefunction(target_func) or inspect.isasyncgenfunction(target_func)
+
+	# Its frame suspends: a "return" event may be a yield or an await, not the end
+	suspends = is_generator or is_async
 
 	call_counter = 0
 
@@ -674,9 +775,7 @@ def _log_function(
 	def _enter_call() -> config.DisplayState:
 		"""Make this call's settings the ones every nested emit reads"""
 
-		return config._push_display(
-			mode, show_time, show_file, show_lineno, filepath, emit_gate
-		)
+		return config._push_display(mode, show_time, show_file, show_lineno, filepath, emit_gate)
 
 	def _build_tracer(
 		display_call_name: str,
@@ -690,23 +789,79 @@ def _log_function(
 		previous_line: dict[FrameType, int] = {}
 		pending_exception: dict[FrameType, object] = {}
 
+		# Plain copies of container locals, to tell when one changed in place
+		snapshots: dict[FrameType, dict[str, object]] = {}
+
+		# A nested frame's own (args, signature); the call's would misreport its exit
+		nested_calls: dict[FrameType, tuple[tuple[object, ...], str]] = {}
+
 		lambda_counter = 0
+
+		def _remember(frame: FrameType, key: str, value: object) -> None:
+			baseline[frame][key] = value
+
+			copy = _snapshot(value)
+			if copy is _NO_VALUE:
+				_ = snapshots[frame].pop(key, None)
+			else:
+				snapshots[frame][key] = copy
+
+		def _report_attributes(obj: object, before: _Attributes, prefix: str, filename: str, lineno: int) -> None:
+			"""Report the attributes of `obj` that changed since `before`, which follows along"""
+
+			# noinspection PyUnnecessaryCast
+			current = cast("dict[str, object]", vars(obj))
+
+			for attr, now in list(current.items()):
+				if attr.startswith("_"):
+					continue
+
+				was = before.get(attr, _NO_VALUE)
+
+				kind: Kind
+				if was is _NO_VALUE:
+					kind = "set"
+				elif _differs(was, now):
+					kind = "change"
+				else:
+					continue
+
+				name = f"{prefix}.{attr}"
+
+				if not _passes_threshold(was, now, _resolve_threshold_for_name(name, threshold)):
+					continue
+
+				if should_emit(kind, name):
+					_emit(
+						kind,
+						name,
+						now,
+						filename=filename,
+						lineno=lineno,
+						filepath=filepath,
+						show_time=show_time,
+						show_file=show_file,
+						show_lineno=show_lineno,
+					)
+
+				before[attr] = _unwrap_value(now)
 
 		def _sample_locals(frame: FrameType, frame_name: str, lineno: int) -> None:
 			code = frame.f_code
 			filename = code.co_filename
 			known = baseline[frame]
+			copies = snapshots[frame]
 
 			# noinspection PyUnnecessaryCast
 			locals_view = cast("dict[str, object]", frame.f_locals)
 
-			# Fetched once; the loop below runs per local per line event
-			watched = _watched_names(code)
+			# A comprehension's loop variable is not one of the function's own
+			in_flight = _comprehension_variables(filename, lineno)
 
 			value: object
 
 			for key, value in list(locals_view.items()):
-				if key == "_":
+				if key == "_" or key in in_flight:
 					continue
 
 				if key in {"self", "cls"}:
@@ -721,50 +876,82 @@ def _log_function(
 
 				# Already reported by an explicit log() / watch()
 				if _was_just_emitted(code, key, lineno):
-					known[key] = value
+					_remember(frame, key, value)
 					continue
 
-				# An explicit watch() / `| l` owns this name for the whole frame
-				if watched is not None and key in watched:
-					known[key] = value
-					continue
+				# Swapped for a logging copy only when this statement just built it:
+				# anything else may be referenced elsewhere, and the copy would split them
+				if old is not value and type(value) in _CONTAINERS:
+					depth = _fresh_binding(filename, lineno, key)
 
-				already_wrapped = isinstance(
-					value, (LoggedObject, LoggedList, LoggedDict, LoggedSet)
-				)
+					if depth:
+						wrapped: object = _wrap_value(value, name=f"{frame_name}.{key}", deep=depth > 1)
 
-				if not already_wrapped:
-					wrapped = _wrap_value(value, name=f"{frame_name}.{key}")
-					if wrapped is not value:
 						try:
 							locals_view[key] = wrapped
 						except (TypeError, ValueError):
 							pass
-						value = wrapped
+						else:
+							value = wrapped  # noqa: PLW2901 -- the logging copy stands in from here on
 
 				if callable(value):
 					continue
+
+				previous = old
+				current = value
+				in_place = old is value
+
+				if in_place:
+					if isinstance(value, _BaseLogged):
+						# It reports its own changes; C code like heapq goes around them
+						if _line_may_mutate(filename, lineno, key):
+							value._logeye_resync(filename, lineno, key)
+						continue
+
+					# Same object; only a change made in place shows, against the copy
+					copy = copies.get(key, _NO_VALUE)
+
+					if copy is _NO_VALUE or not _line_may_mutate(filename, lineno, key):
+						continue
+
+					if isinstance(copy, _Attributes):
+						_report_attributes(value, copy, f"{frame_name}.{key}", filename, lineno)
+						continue
+
+					previous = copy
+					current = _comparable(value)
 
 				name = f"{frame_name}.{key}"
 
 				kind: Kind
 
-				if old is _NO_VALUE:
+				if previous is _NO_VALUE:
 					kind = "set"
-				elif _differs(old, value):
+				elif _differs(previous, current):
 					kind = "change"
 				else:
 					continue
 
 				threshold_spec = _resolve_threshold_for_name(name, threshold)
-				if not _passes_threshold(old, value, threshold_spec):
+				if threshold_spec is None:
+					threshold_spec = _resolve_threshold_for_name(key, _watch_threshold(code, key))
+
+				if not _passes_threshold(previous, current, threshold_spec):
 					continue
 
 				if should_emit(kind, name):
+					shown: object = value
+
+					# Changed in place: written as the call on that line that did it
+					if in_place:
+						observed = _observed_change(_observed_call(filename, lineno, key), previous, value)
+						if observed is not None:
+							shown = observed
+
 					_emit(
 						kind,
 						name,
-						value,
+						shown,
 						filename=filename,
 						lineno=lineno,
 						filepath=filepath,
@@ -773,7 +960,7 @@ def _log_function(
 						show_lineno=show_lineno,
 					)
 
-					known[key] = value
+					_remember(frame, key, value)
 
 		def _register(frame: FrameType, name: str) -> None:
 			# Resuming a generator re-fires "call"; keep the baseline
@@ -782,15 +969,18 @@ def _log_function(
 
 			tracked[frame] = name
 			baseline[frame] = {}
+			snapshots[frame] = {}
 			previous_line[frame] = frame.f_lineno
 
 		def _release(frame: FrameType) -> None:
 			_ = tracked.pop(frame, None)
 			_ = baseline.pop(frame, None)
+			_ = snapshots.pop(frame, None)
+			_ = nested_calls.pop(frame, None)
 			_ = previous_line.pop(frame, None)
 			_ = pending_exception.pop(frame, None)
 
-		def tracer(frame: FrameType, event: str, arg: object) -> TraceFunction | None:
+		def _trace(frame: FrameType, event: str, arg: object) -> TraceFunction | None:
 			nonlocal lambda_counter
 
 			code = frame.f_code
@@ -814,6 +1004,10 @@ def _log_function(
 
 				# Stop at the edge of user code, the stdlib is pages of noise
 				if _is_external_code(filename):
+					return None
+
+				# An awaited coroutine suspends and resumes on its own; @log traces it whole
+				if code.co_flags & _ASYNC_CODE:
 					return None
 
 				nested_name = code.co_name
@@ -843,8 +1037,14 @@ def _log_function(
 				defaults = {
 					name: locals_snapshot[name]
 					for name in code.co_varnames[: code.co_argcount]
-					if name in locals_snapshot
+					if name in locals_snapshot and name not in {"self", "cls"}
 				}
+
+				passed = tuple(_unwrap_value(v) for v in defaults.values())
+				nested_calls[frame] = (
+					passed,
+					_format_call_signature(nested_full_name, passed, {}),
+				)
 
 				if should_emit("call", nested_full_name):
 					_emit(
@@ -893,7 +1093,7 @@ def _log_function(
 							show_lineno=show_lineno,
 						)
 						_mark_emitted(frame, key)
-						baseline[frame][key] = value
+						_remember(frame, key, value)
 
 				return tracer
 
@@ -905,9 +1105,7 @@ def _log_function(
 				# More lines in this frame means it was caught here
 				_ = pending_exception.pop(frame, None)
 
-				_sample_locals(
-					frame, frame_name, previous_line.get(frame, frame.f_lineno)
-				)
+				_sample_locals(frame, frame_name, previous_line.get(frame, frame.f_lineno))
 				previous_line[frame] = frame.f_lineno
 				return tracer
 
@@ -923,12 +1121,16 @@ def _log_function(
 
 				raised = pending_exception.pop(frame, None)
 
+				# A nested frame reports its own arguments, not the traced call's
+				frame_args, frame_kwargs, frame_signature = args, kwargs, call_signature
+				if frame in nested_calls:
+					frame_args, frame_signature = nested_calls[frame]
+					frame_kwargs = {}
+
 				if raised is not None and arg is None:
 					if should_emit("raise", frame_name):
 						# An "exception" event's arg is (type, value, traceback)
-						exc_info = cast(
-							"tuple[type[BaseException], BaseException, object]", raised
-						)
+						exc_info = cast("tuple[type[BaseException], BaseException, object]", raised)
 						exc_type, exc_value = exc_info[0], exc_info[1]
 
 						_emit(
@@ -936,12 +1138,10 @@ def _log_function(
 							frame_name,
 							{
 								"exception": exc_value,
-								"exception_type": getattr(
-									exc_type, "__name__", str(exc_type)
-								),
-								"args": args,
-								"kwargs": kwargs,
-								"call_signature": call_signature,
+								"exception_type": getattr(exc_type, "__name__", str(exc_type)),
+								"args": frame_args,
+								"kwargs": frame_kwargs,
+								"call_signature": frame_signature,
 							},
 							filename=frame.f_code.co_filename,
 							lineno=lineno,
@@ -950,19 +1150,17 @@ def _log_function(
 							show_file=show_file,
 							show_lineno=show_lineno,
 						)
-				elif is_generator:
-					# A generator's "return" is really a yield
+				elif suspends and code is target_code:
+					# Only the wrapper knows whether this was a yield, an await or the end
 					state.exit_line = lineno
 					return tracer
 				elif should_emit("return", frame_name):
 					payload: dict[str, object] = {
 						"value": arg,
-						"args": args,
-						"kwargs": kwargs,
+						"args": frame_args,
+						"kwargs": frame_kwargs,
+						"call_signature": frame_signature,
 					}
-
-					if not is_method_like:
-						payload["call_signature"] = call_signature
 
 					_emit(
 						"return",
@@ -980,16 +1178,21 @@ def _log_function(
 
 			return tracer
 
+		# Under coverage the body runs where the coverage tool can see it
+		tracer = _measurable(_trace)
+
 		state = _CallState(
 			tracer=tracer,
 			name=display_call_name,
 			signature=call_signature,
 			should_emit=should_emit,
+			args=args,
+			kwargs=kwargs,
 		)
 
 		return state
 
-	def _prepare(args: tuple[object, ...], kwargs: dict[str, object]) -> _CallState:
+	def _prepare(args: tuple[object, ...], kwargs: dict[str, object], skip_external: bool = False) -> _CallState:
 		"""Per-call setup: naming, the call record and the tracer"""
 
 		nonlocal call_counter
@@ -998,21 +1201,25 @@ def _log_function(
 		call_id = call_counter
 		call_name = f"{func_path}{'' if call_id == 1 else f'#{call_id}'}"
 
-		call_frame = _caller_frame()
+		call_frame = _caller_frame(skip_external)
 		call_filename, call_lineno = _get_location(call_frame)
 
 		bound_name = None
-		if is_method_like and args:
+		if takes_self and args:
 			bound_name = getattr(args[0], "_logeye_name", None)
+
+		shown_args = args[1:] if takes_self else args
+
+		# Frozen as passed; by the (return) line the body may have changed them in place
+		passed_args = tuple(_unwrap_value(a) for a in shown_args)
+		passed_kwargs = {k: _unwrap_value(v) for k, v in kwargs.items()}
 
 		display_call_name = call_name
 		if bound_name:
 			method_name = func_path.split(".")[-1]
 			display_call_name = f"{bound_name}.{method_name}"
 
-		call_signature = _format_call_signature(
-			display_call_name, args[1:] if bound_name else args, kwargs
-		)
+		call_signature = _format_call_signature(display_call_name, shown_args, kwargs)
 
 		if should_emit("call", display_call_name):
 			target = _get_assignment_target_for_call(call_frame)
@@ -1020,7 +1227,7 @@ def _log_function(
 			_emit(
 				"call",
 				display_call_name,
-				{"target": target, "args": args, "kwargs": kwargs},
+				{"target": target, "args": shown_args, "kwargs": kwargs},
 				filename=call_filename,
 				lineno=call_lineno,
 				filepath=filepath,
@@ -1029,41 +1236,113 @@ def _log_function(
 				show_lineno=show_lineno,
 			)
 
-		state = _build_tracer(
-			display_call_name, call_signature, args, kwargs, should_emit
-		)
+		state = _build_tracer(display_call_name, call_signature, passed_args, passed_kwargs, should_emit)
 
 		state.call_filename = call_filename
 		state.call_lineno = call_lineno
 
 		return state
 
-	def _emit_untraced_exit(
-		state: _CallState,
-		kind: Kind,
-		payload: dict[str, object],
-		args: tuple[object, ...],
-		kwargs: dict[str, object],
-	) -> None:
+	def _emit_untraced_exit(state: _CallState, kind: Kind, payload: dict[str, object]) -> None:
 		"""Report an exit sys.settrace never saw"""
 
 		if state.traced or not state.should_emit(kind, state.name):
 			return
 
-		payload["args"] = args
-		payload["kwargs"] = kwargs
+		payload["args"] = state.args
+		payload["kwargs"] = state.kwargs
+		payload["call_signature"] = state.signature
 
-		_emit(
-			kind,
-			state.name,
-			payload,
-			filename=state.call_filename,
-			lineno=state.call_lineno,
-			filepath=filepath,
-			show_time=show_time,
-			show_file=show_file,
-			show_lineno=show_lineno,
-		)
+		# Its own display state: an awaited coroutine is no longer inside the call
+		previous = _enter_call()
+		try:
+			_emit(
+				kind,
+				state.name,
+				payload,
+				filename=state.call_filename,
+				lineno=state.call_lineno,
+				filepath=filepath,
+				show_time=show_time,
+				show_file=show_file,
+				show_lineno=show_lineno,
+			)
+		finally:
+			config._pop_display(previous)
+
+	def _raised(caught: BaseException) -> dict[str, object]:
+		return {"exception": caught, "exception_type": type(caught).__name__}
+
+	def _emit_exit(state: _CallState, kind: Kind, value: object) -> None:
+		"""Report a yield, or the end, of a body that suspends, from where it stopped"""
+
+		if not state.should_emit(kind, state.name):
+			return
+
+		payload: dict[str, object] = {
+			"value": value,
+			"args": state.args,
+			"kwargs": state.kwargs,
+			"call_signature": state.signature,
+		}
+
+		previous = _enter_call()
+		try:
+			_emit(
+				kind,
+				state.name,
+				payload,
+				filename=target_code.co_filename if target_code else None,
+				lineno=state.exit_line,
+				filepath=filepath,
+				show_time=show_time,
+				show_file=show_file,
+				show_lineno=show_lineno,
+			)
+		finally:
+			config._pop_display(previous)
+
+	def _resume(state: _CallState, step: Callable[[], object]) -> object:
+		"""
+		Run one step of a suspended body with its tracer installed, and only that step
+		The body runs on next() / send() / an event loop's schedule, long after the call
+		returned, and between steps other code keeps whatever tracing it had
+		"""
+
+		previous = _enter_call()
+		old_trace = sys.gettrace()
+		sys.settrace(state.tracer)
+
+		try:
+			return step()
+		finally:
+			sys.settrace(old_trace)
+			config._pop_display(previous)
+
+	def _drive(state: _CallState, awaitable: Awaitable[object]) -> Generator[object, object, object]:
+		"""
+		Await `awaitable` one step at a time, traced only while its body runs
+		Whenever it suspends, the event loop's other tasks run without this call's tracer
+		"""
+
+		steps = awaitable.__await__()
+		step: Callable[[], object] = functools.partial(steps.send, None)
+
+		while True:
+			try:
+				suspended_on = _resume(state, step)
+			except StopIteration as stop:
+				return cast(object, stop.value)
+
+			try:
+				sent = yield suspended_on
+			except GeneratorExit:
+				steps.close()
+				raise
+			except BaseException as caught:
+				step = functools.partial(steps.throw, caught)
+			else:
+				step = functools.partial(steps.send, sent)
 
 	if target_code is None:
 		# C callables don't have a Python frame; tracer can't see the exit
@@ -1079,65 +1358,101 @@ def _log_function(
 				try:
 					result = func(*args, **kwargs)
 				except BaseException as caught:
-					_emit_untraced_exit(
-						state,
-						"raise",
-						{
-							"exception": caught,
-							"exception_type": type(caught).__name__,
-							"call_signature": state.signature,
-						},
-						args,
-						kwargs,
-					)
+					_emit_untraced_exit(state, "raise", _raised(caught))
 					raise
 
-				_emit_untraced_exit(
-					state,
-					"return",
-					{"value": result, "call_signature": state.signature},
-					args,
-					kwargs,
-				)
+				_emit_untraced_exit(state, "return", {"value": result})
 				return result
 			finally:
 				config._pop_display(previous)
 
 		return native_wrapper
 
-	if is_async:
-		# settrace cannot follow a coroutine across an await, so warn instead
-		@functools.wraps(func)
-		def async_wrapper(*args: P.args, **kwargs: P.kwargs) -> T:
-			if config._g_enabled:
-				warnings.warn(
-					f"logeye cannot trace the body of async function {func_path!r};"
-					+ " only the call itself is logged",
-					RuntimeWarning,
-					stacklevel=2,
-				)
+	if inspect.iscoroutinefunction(target_func):
+		# noinspection PyUnnecessaryCast
+		coroutine_func = cast("Callable[..., Awaitable[object]]", func)
 
+		# async def, so inspect.iscoroutinefunction() and every framework asking it agree
+		@functools.wraps(func)
+		async def coroutine_wrapper(*args: object, **kwargs: object) -> object:
+			if not config._g_enabled:
+				return await coroutine_func(*args, **kwargs)
+
+			previous = _enter_call()
+			try:
+				# Run by an event loop, the frame below is asyncio's
+				state = _prepare(args, kwargs, skip_external=True)
+			finally:
+				config._pop_display(previous)
+
+			try:
+				result = await _Driven(_drive(state, coroutine_func(*args, **kwargs)))
+			except BaseException as caught:
+				# Before the body ran (bad arguments); after it, the tracer reported it
+				_emit_untraced_exit(state, "raise", _raised(caught))
+				raise
+
+			_emit_exit(state, "return", result)
+			return result
+
+		# noinspection PyUnnecessaryCast
+		return cast("Callable[P, T]", coroutine_wrapper)
+
+	if inspect.isasyncgenfunction(target_func):
+		# noinspection PyUnnecessaryCast
+		agen_func = cast("Callable[..., AsyncGenerator[object, object]]", func)
+
+		# async def with yield, so it is an async generator function to anything that asks
+		@functools.wraps(func)
+		async def async_generator_wrapper(*args: object, **kwargs: object) -> AsyncGenerator[object, object]:
+			generator = agen_func(*args, **kwargs)
+			state: _CallState | None = None
+
+			if config._g_enabled:
 				previous = _enter_call()
 				try:
-					_ = _prepare(args, kwargs)
+					state = _prepare(args, kwargs, skip_external=True)
 				finally:
 					config._pop_display(previous)
 
-			return func(*args, **kwargs)
+			def run(awaitable: Awaitable[object]) -> Awaitable[object]:
+				return awaitable if state is None else _Driven(_drive(state, awaitable))
 
-		return async_wrapper
+			# What to run next: asend() the consumer's value, or athrow() its exception
+			step: Callable[[], Awaitable[object]] = functools.partial(generator.asend, None)
+
+			while True:
+				try:
+					item = await run(step())
+				except StopAsyncIteration:
+					if state is not None:
+						_emit_exit(state, "return", None)
+					return
+
+				if state is not None:
+					_emit_exit(state, "yield", item)
+
+				try:
+					sent = yield item
+				except GeneratorExit:
+					_ = await run(generator.aclose())
+					raise
+				except BaseException as caught:
+					step = functools.partial(generator.athrow, caught)
+				else:
+					step = functools.partial(generator.asend, sent)
+
+		# noinspection PyUnnecessaryCast
+		return cast("Callable[P, T]", async_generator_wrapper)
 
 	if is_generator:
 		# noinspection PyUnnecessaryCast
 		gen_func = cast("Callable[..., Generator[object, object, object]]", func)
 
 		@functools.wraps(func)
-		def generator_wrapper(
-			*args: object, **kwargs: object
-		) -> Generator[object, object, object]:
+		def generator_wrapper(*args: object, **kwargs: object) -> Generator[object, object, object]:
 			if not config._g_enabled:
-				yield from gen_func(*args, **kwargs)
-				return
+				return (yield from gen_func(*args, **kwargs))
 
 			previous = _enter_call()
 			try:
@@ -1145,78 +1460,32 @@ def _log_function(
 			finally:
 				config._pop_display(previous)
 
-			tracer = state.tracer
 			generator = gen_func(*args, **kwargs)
 
-			def _emit_exit(kind: Kind, value: object) -> None:
-				if not state.should_emit(kind, state.name):
-					return
-
-				payload: dict[str, object] = {
-					"value": value,
-					"args": args,
-					"kwargs": kwargs,
-				}
-
-				if not is_method_like:
-					payload["call_signature"] = state.signature
-
-				_emit(
-					kind,
-					state.name,
-					payload,
-					filename=target_code.co_filename if target_code else None,
-					lineno=state.exit_line,
-					filepath=filepath,
-					show_time=show_time,
-					show_file=show_file,
-					show_lineno=show_lineno,
-				)
-
-			def _resume(step: Callable[[], object]) -> object:
-				"""
-				Run one step of the generator with tracing installed
-				The body only runs between next()/send(), long after the wrapper returned
-				"""
-
-				previous = _enter_call()
-				old_trace = sys.gettrace()
-				sys.settrace(tracer)
-
-				try:
-					return step()
-				finally:
-					sys.settrace(old_trace)
-					config._pop_display(previous)
-
-			to_send: object = None
+			# What to run next: send() the consumer's value, or throw() its exception
+			step: Callable[[], object] = functools.partial(generator.send, None)
 
 			while True:
 				try:
-					item = _resume(lambda: generator.send(to_send))
+					item = _resume(state, step)
 				except StopIteration as stop:
-					_emit_exit("return", cast(object, stop.value))
-					return
+					returned = cast(object, stop.value)
+					_emit_exit(state, "return", returned)
 
-				_emit_exit("yield", item)
+					# `yield from` hands this on to whoever delegated
+					return returned
+
+				_emit_exit(state, "yield", item)
 
 				try:
-					to_send = yield item
+					sent = yield item
 				except GeneratorExit:
 					_ = generator.close()
 					raise
 				except BaseException as caught:
-					# Python clears the `except` name at block end
-					thrown = caught
-
-					try:
-						item = _resume(lambda: generator.throw(thrown))
-					except StopIteration as stop:
-						_emit_exit("return", cast(object, stop.value))
-						return
-
-					_emit_exit("yield", item)
-					to_send = yield item
+					step = functools.partial(generator.throw, caught)
+				else:
+					step = functools.partial(generator.send, sent)
 
 		# noinspection PyUnnecessaryCast
 		return cast("Callable[P, T]", generator_wrapper)
@@ -1240,29 +1509,13 @@ def _log_function(
 				sys.settrace(old_trace)
 
 				# A C decorator in between may have raised before the body ran
-				_emit_untraced_exit(
-					state,
-					"raise",
-					{
-						"exception": caught,
-						"exception_type": type(caught).__name__,
-						"call_signature": state.signature,
-					},
-					args,
-					kwargs,
-				)
+				_emit_untraced_exit(state, "raise", _raised(caught))
 				raise
 			finally:
 				sys.settrace(old_trace)
 
 			# Nothing was traced when a C decorator answered on its own
-			_emit_untraced_exit(
-				state,
-				"return",
-				{"value": result, "call_signature": state.signature},
-				args,
-				kwargs,
-			)
+			_emit_untraced_exit(state, "return", {"value": result})
 			return result
 		finally:
 			config._pop_display(previous)
@@ -1292,10 +1545,7 @@ def _log_object(
 		if name is None:
 			name = _get_assignment_target_for_call(frame)
 
-		if not name:
-			name = "set"
-
-		wrapped = LoggedObject(obj, name=name)
+		wrapped = LoggedObject(obj, name=name or "set")
 
 		filename, lineno = _get_location(frame)
 
@@ -1307,19 +1557,16 @@ def _log_object(
 		else:
 			value = cast("dict[object, object]", cast(object, vars(obj)))
 
-		_emit(
-			"set",
+		_emit_named_or_message(
 			name,
 			value,
+			frame=frame,
 			filename=filename,
 			lineno=lineno,
 			show_time=show_time,
 			show_file=show_file,
 			show_lineno=show_lineno,
 		)
-
-		if frame is not None:
-			_mark_emitted(frame, name)
 	finally:
 		del frame
 
@@ -1337,16 +1584,8 @@ def _log_message(
 	frame = _caller_frame()
 
 	try:
-		if args or kwargs:
-			rendered = _format_message(text, *args, **kwargs)
-		else:
-			rendered = _expand_template(text)
-
-		# $var expansion always runs
-		try:
-			rendered = _expand_template(rendered)
-		except Exception:
-			pass
+		# The template is expanded once; a value it pulls in is never expanded again
+		rendered = _format_message(text, *args, **kwargs) if args or kwargs else _expand_template(text)
 
 		if not config._g_enabled or config._g_deco_only:
 			return rendered
@@ -1505,10 +1744,7 @@ def _dispatch_log(
 	if show_wrapper_locals is None:
 		show_wrapper_locals = False
 
-	if mode is None:
-		mode = config._mode()
-	else:
-		mode = config._normalize_mode(mode)
+	mode = config._mode() if mode is None else config._normalize_mode(mode)
 
 	filter_set = set(filter) if filter else None
 	deco_path = _resolve_filepath(file=file, filepath=filepath)
@@ -1525,6 +1761,26 @@ def _dispatch_log(
 	if mode == "educational":
 		show_file = False
 		show_lineno = False
+
+	if isinstance(obj, (staticmethod, classmethod)):
+		# Wrap the function inside; a plain wrapper in a class body would be handed self
+		# noinspection PyUnnecessaryCast
+		descriptor = cast("staticmethod[..., object] | classmethod[object, ..., object]", obj)
+
+		return type(descriptor)(
+			_log_function(
+				descriptor.__func__,
+				filepath=deco_path,
+				level=level,
+				filter_set=filter_set,
+				mode=mode,
+				threshold=threshold,
+				show_time=show_time,
+				show_file=show_file,
+				show_lineno=show_lineno,
+				show_wrapper_locals=show_wrapper_locals,
+			)
+		)
 
 	if inspect.isclass(obj):
 		return _log_class(
@@ -1570,22 +1826,34 @@ def _dispatch_log(
 			show_lineno=show_lineno,
 		)
 
-	# Plain objects return as-is; @log on the class already handled them
-	if hasattr(obj, "__dict__"):
+	# An instance of a @log class already reported its own construction
+	if getattr(type(obj).__init__, "_logeye_patched", False):
 		return obj
 
 	if isinstance(obj, list):
 		frame = _caller_frame()
 
 		try:
-			name = _get_assignment_target_for_call(frame) or "set"
+			name = _get_assignment_target_for_call(frame)
+			filename, lineno = _get_location(frame)
 
-			if frame is not None:
+			if name and frame is not None:
 				_mark_watched(frame, name, threshold=threshold)
 				_install_global_trace(frame)
 
+			_emit_named_or_message(
+				name,
+				cast(object, obj),
+				frame=frame,
+				filename=filename,
+				lineno=lineno,
+				show_time=show_time,
+				show_file=show_file,
+				show_lineno=show_lineno,
+			)
+
 			# noinspection PyUnnecessaryCast
-			return _wrap_value(cast("list[object]", obj), name=name)
+			return _wrap_value(cast("list[object]", obj), name=name or "set")
 		finally:
 			del frame
 
@@ -1696,13 +1964,13 @@ def _log_pipe_value(other: object) -> object:
 __all__ = [
 	"Kind",
 	"Level",
-	"watch",
-	"_LogAPI",
 	"_BoundLog",
+	"_LogAPI",
 	"_dispatch_log",
 	"_log_class",
 	"_log_function",
-	"_log_object",
 	"_log_message",
+	"_log_object",
 	"_log_pipe_value",
+	"watch",
 ]

@@ -5,7 +5,7 @@ import ast
 import time
 import linecache
 
-from typing import NamedTuple
+from typing import NamedTuple, Tuple, cast
 
 from .. import config
 from types import FrameType
@@ -54,6 +54,9 @@ class _LineInfo(NamedTuple):
 	# False when the line could not be read or parsed
 	parsed: bool
 
+	# The function a plain call on the right-hand side calls: `x = Foo(...)` -> "Foo"
+	callee: str | None = None
+
 
 _NO_INFO = _LineInfo(None, None, (), False)
 
@@ -89,7 +92,7 @@ def _invalidate_if_stale(filename: str) -> None:
 
 	_file_stamp_cache[filename] = stamp
 	_ = _module_cache.pop(filename, None)
-	_ = _assignments_cache.pop(filename, None)
+	_ = _tables_cache.pop(filename, None)
 
 	for key in [k for k in _line_info_cache if k[0] == filename]:
 		del _line_info_cache[key]
@@ -156,11 +159,7 @@ def _info_from_statement(stmt: ast.AST) -> _LineInfo | None:
 	log_single = None
 
 	# x = log(...)
-	if _is_direct_log_call(value):
-		log_single = single
-
-	# x = something | l
-	elif (
+	if _is_direct_log_call(value) or (
 		isinstance(value, ast.BinOp)
 		and isinstance(value.op, ast.BitOr)
 		and isinstance(value.right, ast.Name)
@@ -172,7 +171,15 @@ def _info_from_statement(stmt: ast.AST) -> _LineInfo | None:
 	if isinstance(value, (ast.Tuple, ast.List)) and tuple_names:
 		return _LineInfo(log_single, single, tuple_names, True)
 
-	return _LineInfo(log_single, single, (), True)
+	callee: str | None = None
+	if isinstance(value, ast.Call):
+		func = value.func
+		if isinstance(func, ast.Name):
+			callee = func.id
+		elif isinstance(func, ast.Attribute):
+			callee = func.attr
+
+	return _LineInfo(log_single, single, (), True, callee)
 
 
 def _analyze_line(filename: str, lineno: int) -> _LineInfo:
@@ -238,7 +245,7 @@ def _module_ast(filename: str) -> ast.Module | None:
 	tree: ast.Module | None
 
 	try:
-		with open(filename, "r", encoding="utf-8") as f:
+		with open(filename, encoding="utf-8") as f:
 			tree = ast.parse(f.read())
 	except (OSError, SyntaxError, ValueError):
 		tree = None
@@ -247,8 +254,279 @@ def _module_ast(filename: str) -> ast.Module | None:
 	return tree
 
 
-# filename -> {lineno: names bound there}, invalidated with the line cache
-_assignments_cache: dict[str, dict[int, frozenset[str]]] = {}
+# What the call that changed a container looked like: `heappush(heap, x)` is
+# ("heappush", True, 1) and `queue.popleft()` is ("popleft", False, 0)
+Operation = Tuple[str, bool, int]
+
+
+class _FileTables(NamedTuple):
+	"""Per-line facts about one source file, built from a single walk of its AST"""
+
+	# Names each line binds
+	assigns: dict[int, frozenset[str]]
+
+	# Names whose object a line may change in place: `x.append(v)`, `x[i] = v`, `f(x)`
+	mutates: dict[int, frozenset[str]]
+
+	# Lines that store a container the statement itself just built:
+	# line -> (the plain name it binds, None for obj.attr / obj[key]; fresh depth)
+	fresh: dict[int, tuple[str | None, int]]
+
+	# Loop variables of list / set / dict comprehensions, which 3.12+ runs in the
+	# enclosing frame; they show up among its locals while the line runs
+	comprehension: dict[int, frozenset[str]]
+
+	# The call on a line that may have changed a variable's container:
+	# line -> {variable: (operation, written as a function?, other arguments)}
+	calls: dict[int, dict[str, Operation]]
+
+
+# filename -> its tables, invalidated with the line cache
+_tables_cache: dict[str, _FileTables] = {}
+
+# Displays and comprehensions always build a new container
+_FRESH_DISPLAYS = (ast.List, ast.Set, ast.Dict, ast.ListComp, ast.SetComp, ast.DictComp)
+_FRESH_CALLS = frozenset({"list", "dict", "set"})
+
+# Element expressions that can hand back an object which already existed
+_BORROWING_NODES = (ast.Name, ast.Call, ast.Await, ast.Yield, ast.YieldFrom)
+
+# Only these run between an assignment and the next line event when they share its line
+_SIMPLE_STATEMENTS = (
+	ast.Expr,
+	ast.Assign,
+	ast.AugAssign,
+	ast.AnnAssign,
+	ast.Return,
+	ast.Delete,
+	ast.Raise,
+	ast.Assert,
+	ast.Import,
+	ast.ImportFrom,
+	ast.Global,
+	ast.Nonlocal,
+	ast.Pass,
+	ast.Break,
+	ast.Continue,
+)
+
+# Passing a container to these, or calling these methods on it, never changes it
+_READ_ONLY_CALLS = frozenset(
+	{
+		"abs", "all", "any", "bool", "dict", "enumerate", "filter", "float",
+		"frozenset", "hash", "id", "int", "isinstance", "iter", "len", "list",
+		"map", "max", "min", "print", "range", "repr", "reversed", "set",
+		"sorted", "str", "sum", "tuple", "type", "zip",
+	}
+)  # fmt: skip
+_READ_ONLY_METHODS = frozenset({"copy", "count", "get", "index", "items", "keys", "values"})
+
+# Functions that rearrange the list they are given, whatever its methods do: heapq
+# writes to its storage directly, and these read best as the call that was made
+_MUTATING_FUNCTIONS = frozenset(
+	{
+		"heappush",
+		"heappop",
+		"heapify",
+		"heapreplace",
+		"heappushpop",
+		"insort",
+		"insort_left",
+		"insort_right",
+		"shuffle",
+	}
+)
+
+
+def _fresh_depth_of(value: ast.expr) -> int:
+	"""
+	How much of the container `value` evaluates to is new: 2 every level, 1 only the
+	outermost, 0 none. Only a new object can be swapped for a logging copy unnoticed;
+	anything else may be referenced from somewhere the copy would not reach
+	"""
+
+	if isinstance(value, ast.Call):
+		if not (isinstance(value.func, ast.Name) and value.func.id in _FRESH_CALLS):
+			return 0
+
+		# list(x) is a new list holding x's existing elements
+		return 1 if value.args or value.keywords else 2
+
+	parts: list[ast.expr | None]
+
+	if isinstance(value, (ast.ListComp, ast.SetComp)):
+		parts = [value.elt]
+	elif isinstance(value, ast.DictComp):
+		parts = [value.value]
+	elif isinstance(value, ast.Dict):
+		parts = list(value.values)
+	elif isinstance(value, (ast.List, ast.Set)):
+		parts = list(value.elts)
+	else:
+		return 0
+
+	borrowed = any(isinstance(node, _BORROWING_NODES) for part in parts if part is not None for node in ast.walk(part))
+
+	return 1 if borrowed else 2
+
+
+def _base_name(node: ast.expr) -> str | None:
+	"""The variable at the root of `a`, `a.b`, `a[0].c`, `*a`"""
+
+	while isinstance(node, (ast.Attribute, ast.Subscript, ast.Starred)):
+		node = node.value
+
+	return node.id if isinstance(node, ast.Name) else None
+
+
+def _mutated_bases(node: ast.AST) -> list[ast.expr]:
+	"""Expressions whose object `node` may change in place"""
+
+	if isinstance(node, ast.Call):
+		func = node.func
+
+		if isinstance(func, ast.Name) and func.id in _READ_ONLY_CALLS:
+			return []
+
+		if isinstance(func, ast.Attribute):
+			if func.attr in _READ_ONLY_METHODS:
+				return []
+
+			bases = [func.value]
+		else:
+			bases = []
+
+		return bases + list(node.args) + [kw.value for kw in node.keywords]
+
+	if isinstance(node, (ast.Attribute, ast.Subscript)) and isinstance(node.ctx, (ast.Store, ast.Del)):
+		return [node.value]
+
+	if isinstance(node, ast.AugAssign):
+		return [node.target]
+
+	return []
+
+
+def _call_on_variable(node: ast.Call) -> tuple[str, Operation] | None:
+	"""The variable a call may change in place, and how the call reads"""
+
+	func = node.func
+	arguments = len(node.args) + len(node.keywords)
+
+	callee: str | None = None
+	if isinstance(func, ast.Name):
+		callee = func.id
+	elif isinstance(func, ast.Attribute):
+		callee = func.attr
+
+	first = node.args[0] if node.args else None
+
+	# heapq.heappush(heap, x): the list is the first argument
+	if callee in _MUTATING_FUNCTIONS and isinstance(first, ast.Name):
+		return first.id, (callee, True, arguments - 1)
+
+	# queue.popleft()
+	if isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name) and func.attr not in _READ_ONLY_METHODS:
+		return func.value.id, (func.attr, False, arguments)
+
+	return None
+
+
+def _span(node: ast.AST) -> range:
+	start = cast(int, getattr(node, "lineno"))  # noqa: B009 -- ast.AST does not declare lineno
+	end = cast("int | None", getattr(node, "end_lineno", None))
+	return range(start, (end or start) + 1)
+
+
+def _build_tables(filename: str) -> _FileTables:
+	assigns: dict[int, set[str]] = {}
+	mutates: dict[int, set[str]] = {}
+	comprehension: dict[int, set[str]] = {}
+	calls: dict[int, dict[str, Operation]] = {}
+	statements: dict[int, int] = {}
+	candidates: list[tuple[ast.stmt, str | None, int]] = []
+
+	module = _module_ast(filename)
+
+	if module is not None:
+		for node in ast.walk(module):
+			for target in _assignment_targets(node):
+				names = {name for name in _flatten_target_names(target) if name}
+				if not names:
+					continue
+
+				# The target's own span, not the statement's; a `for` header
+				# binds on its own line, not down the whole loop body
+				for line in _span(target):
+					assigns.setdefault(line, set()).update(names)
+
+			for base in _mutated_bases(node):
+				name = _base_name(base)
+				if name:
+					for line in _span(node):
+						mutates.setdefault(line, set()).add(name)
+
+			if isinstance(node, ast.Call):
+				observed = _call_on_variable(node)
+				if observed is not None:
+					for line in _span(node):
+						calls.setdefault(line, {})[observed[0]] = observed[1]
+
+			if isinstance(node, (ast.ListComp, ast.SetComp, ast.DictComp)):
+				for generator in node.generators:
+					for line in _span(node):
+						comprehension.setdefault(line, set()).update(
+							name for name in _flatten_target_names(generator.target) if name
+						)
+
+			if isinstance(node, _SIMPLE_STATEMENTS):
+				for line in _span(node):
+					statements[line] = statements.get(line, 0) + 1
+
+			if isinstance(node, (ast.Assign, ast.AnnAssign)) and node.value is not None:
+				targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+				depth = _fresh_depth_of(node.value)
+
+				if len(targets) == 1 and depth:
+					target = targets[0]
+					bound = target.id if isinstance(target, ast.Name) else None
+					candidates.append((node, bound, depth))
+
+	fresh: dict[int, tuple[str | None, int]] = {}
+
+	for statement, bound, depth in candidates:
+		lines = _span(statement)
+
+		# `a = []; b = a` aliases before anything gets to look; only a lone statement is safe
+		if all(statements.get(line) == 1 for line in lines):
+			for line in lines:
+				fresh[line] = (bound, depth)
+
+	return _FileTables(
+		{line: frozenset(names) for line, names in assigns.items()},
+		{line: frozenset(names) for line, names in mutates.items()},
+		fresh,
+		{line: frozenset(names) for line, names in comprehension.items()},
+		calls,
+	)
+
+
+def _tables(filename: str) -> _FileTables:
+	"""
+	The tables for `filename`. Asked on every line event, so the warm path is dict
+	lookups and nothing else; they are only rebuilt when the file changed on disk
+	"""
+
+	tables = _tables_cache.get(filename)
+
+	if tables is None or time.monotonic() - _file_checked_at.get(filename, 0.0) >= _STALE_CHECK_INTERVAL:
+		_invalidate_if_stale(filename)
+		tables = _tables_cache.get(filename)
+
+		if tables is None:
+			tables = _tables_cache[filename] = _build_tables(filename)
+
+	return tables
 
 
 def _assignment_targets(node: ast.AST) -> list[ast.expr]:
@@ -269,37 +547,6 @@ def _assignment_targets(node: ast.AST) -> list[ast.expr]:
 	return []
 
 
-def _assignments_of_file(filename: str) -> dict[int, frozenset[str]]:
-	"""Every line that binds a name, mapped to the names it binds"""
-
-	cached = _assignments_cache.get(filename)
-	if cached is not None:
-		return cached
-
-	table: dict[int, set[str]] = {}
-	module = _module_ast(filename)
-
-	if module is not None:
-		for node in ast.walk(module):
-			for target in _assignment_targets(node):
-				names = {name for name in _flatten_target_names(target) if name}
-				if not names:
-					continue
-
-				# The target's own span, not the statement's; a `for` header
-				# binds on its own line, not down the whole loop body
-				start = target.lineno
-				end = getattr(target, "end_lineno", start) or start
-
-				for line in range(start, end + 1):
-					table.setdefault(line, set()).update(names)
-
-	frozen = {line: frozenset(names) for line, names in table.items()}
-	_assignments_cache[filename] = frozen
-
-	return frozen
-
-
 _NO_NAMES: frozenset[str] = frozenset()
 
 
@@ -308,25 +555,64 @@ def _line_assigns(filename: str, lineno: int | None, name: str) -> bool:
 
 	Tells a genuine re-assignment apart from a line that merely read the name,
 	so watching can report `x = 1` twice in a row instead of swallowing the second
-
-	The watcher asks this on every line event, so the warm path is dict lookups
-	and nothing else; the table is only rebuilt when the file changed on disk
 	"""
 
 	if not filename or lineno is None:
 		return False
 
-	table = _assignments_cache.get(filename)
-
-	if (
-		table is None
-		or time.monotonic() - _file_checked_at.get(filename, 0.0) >= _STALE_CHECK_INTERVAL
-	):
-		_invalidate_if_stale(filename)
-		table = _assignments_of_file(filename)
-
 	# Watched names are bare locals; a dotted one never matches a target
-	return name in table.get(lineno, _NO_NAMES)
+	return name in _tables(filename).assigns.get(lineno, _NO_NAMES)
+
+
+def _line_may_mutate(filename: str, lineno: int | None, name: str) -> bool:
+	"""Could the statement at filename:lineno have changed `name`'s object in place?"""
+
+	if not filename or lineno is None:
+		return False
+
+	return name in _tables(filename).mutates.get(lineno, _NO_NAMES)
+
+
+def _comprehension_variables(filename: str, lineno: int | None) -> frozenset[str]:
+	"""Comprehension loop variables in flight on this line, not also assigned by it"""
+
+	if not filename or lineno is None:
+		return _NO_NAMES
+
+	tables = _tables(filename)
+	names = tables.comprehension.get(lineno)
+
+	if not names:
+		return _NO_NAMES
+
+	return names - tables.assigns.get(lineno, _NO_NAMES)
+
+
+def _observed_call(filename: str | None, lineno: int | None, name: str) -> Operation | None:
+	"""The call at filename:lineno that may have changed `name`'s container in place"""
+
+	if not filename or lineno is None:
+		return None
+
+	return _tables(filename).calls.get(lineno, {}).get(name)
+
+
+def _fresh_binding(filename: str | None, lineno: int | None, name: str | None = None) -> int:
+	"""
+	Fresh depth (see _fresh_depth_of) of the container the statement at
+	filename:lineno stores, 0 when it may already exist elsewhere.
+	With `name`, the statement must also be binding that plain variable
+	"""
+
+	if not filename or lineno is None:
+		return 0
+
+	entry = _tables(filename).fresh.get(lineno)
+
+	if entry is None or (name is not None and entry[0] != name):
+		return 0
+
+	return entry[1]
 
 
 def _get_call_index_in_line(frame: FrameType, target_count: int) -> int:
@@ -352,10 +638,11 @@ def _unpacked_name(frame: FrameType, names: tuple[str, ...]) -> str | None:
 	return names[_get_call_index_in_line(frame, len(names))] or None
 
 
-def _infer_name_from_frame(
-	frame: FrameType | None, default: str = "PLACEHOLDER"
-) -> str | None:
-	"""Infer the variable name, handling `x = ...` and `a, b = ..., ...`"""
+def _infer_name_from_frame(frame: FrameType | None, default: str | None = None) -> str | None:
+	"""
+	Infer the variable name, handling `x = ...` and `a, b = ..., ...`
+	None (log it as a message) when the source cannot be read: the REPL, exec()
+	"""
 
 	if frame is None:
 		return default
@@ -375,6 +662,17 @@ def _infer_name_from_frame(
 	return None
 
 
+def _get_constructed_target(frame: FrameType | None, callee: str) -> str | None:
+	"""The variable a plain `target = callee(...)` on the frame's line assigns to"""
+
+	if frame is None:
+		return None
+
+	info = _analyze_line(frame.f_code.co_filename, frame.f_lineno)
+
+	return info.any_single if info.callee == callee else None
+
+
 def _get_assignment_target_for_call(frame: FrameType | None) -> str | None:
 	"""Which variable a log(...) call is assigned to"""
 
@@ -390,10 +688,15 @@ def _get_assignment_target_for_call(frame: FrameType | None) -> str | None:
 
 
 __all__ = [
+	"_comprehension_variables",
+	"_fresh_binding",
+	"_get_assignment_target_for_call",
+	"_get_call_index_in_line",
+	"_get_constructed_target",
+	"_infer_name_from_frame",
+	"_is_direct_log_call",
 	"_is_user_code",
 	"_line_assigns",
-	"_is_direct_log_call",
-	"_infer_name_from_frame",
-	"_get_call_index_in_line",
-	"_get_assignment_target_for_call",
+	"_line_may_mutate",
+	"_observed_call",
 ]

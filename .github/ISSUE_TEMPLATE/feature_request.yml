@@ -1,0 +1,16 @@
+name: Feature request
+description: Something LogEye should show, or show differently
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What are you trying to see?
+      description: The code you are debugging or teaching with, and what is missing from the output.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What would the output look like?
+      render: text

@@ -1,16 +1,28 @@
-.venv
-.idea
+# Environments
+.venv/
+venv/
 
-logeye/__pycache__
+# Editors
+.idea/
+.vscode/
+
+# Python
 __pycache__/
-*.pyc
-*.pyo
-*.pyd
+*.py[cod]
 
+# Build
 build/
 dist/
 *.egg-info/
 
+# Tools
 .pytest_cache/
-
+.ruff_cache/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
 uv.lock
+
+# Demo output
+demos/output/

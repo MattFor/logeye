@@ -1,9 +1,13 @@
 import sys
+import contextlib
 
-if sys.version_info >= (3, 12):
-	from typing import override
-else:
-	# Runtime-only fallback for 3.10 / 3.11
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+	from typing_extensions import override
+elif sys.version_info >= (3, 12):
+	from typing import override  # pyright: ignore[reportUnreachable]
+else:  # pragma: no cover - measured on 3.12+, this runs on 3.8 to 3.11
 	from typing import TypeVar  # pyright: ignore[reportUnreachable]
 
 	_F = TypeVar("_F")
@@ -11,11 +15,9 @@ else:
 	def override(method: _F, /) -> _F:
 		"""Backport of typing.override marks only the method"""
 
-		try:
+		# Not every callable accepts attributes
+		with contextlib.suppress(AttributeError, TypeError):
 			method.__override__ = True
-		except (AttributeError, TypeError):
-			# Not every callable accepts attributes
-			pass
 
 		return method
 

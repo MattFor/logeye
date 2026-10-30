@@ -1,0 +1,44 @@
+--- Builtins and C functions ---
+(call) len args=([1, 2, 3])
+(return) len args=([1, 2, 3]) -> 3
+(call) sqrt args=(144)
+(return) sqrt args=(144) -> 12.0
+
+--- A builtin that raises ---
+(call) dict.__getitem__ args=('coffee')
+(raise) dict.__getitem__ args=('coffee') -! KeyError: 'coffee'
+...the KeyError reaches the caller unchanged
+
+--- functools.partial and callable objects ---
+(call) partial(max) args=(4)
+(return) partial(max) args=(4) -> 10
+(call) Doubler args=(21)
+(return) Doubler args=(21) -> 42
+
+--- C types cannot be patched, so they come back unchanged ---
+warning: logeye cannot instrument the C type 'int'; it is returned unchanged
+log(int) is int: True
+
+--- Async functions: traced across every await ---
+iscoroutinefunction: True
+(call) fetch_price args=('tea')
+(set) fetch_price.item = 'tea'
+(set) fetch_price.price = 3.5
+(return) fetch_price args=('tea') -> 3.5
+
+--- Async generators: every value yielded ---
+(call) receipt args=(['tea', 'cake'])
+(set) receipt.items = ['tea', 'cake']
+(set) receipt.item = 'tea'
+(call) fetch_price#2 args=('tea')
+(set) fetch_price#2.item = 'tea'
+(set) fetch_price#2.price = 3.5
+(return) fetch_price#2 args=('tea') -> 3.5
+(yield) receipt args=(['tea', 'cake']) -> ('tea', 3.5)
+(change) receipt.item = 'cake'
+(call) fetch_price#3 args=('cake')
+(set) fetch_price#3.item = 'cake'
+(set) fetch_price#3.price = 4.0
+(return) fetch_price#3 args=('cake') -> 4.0
+(yield) receipt args=(['tea', 'cake']) -> ('cake', 4.0)
+(return) receipt args=(['tea', 'cake']) -> None

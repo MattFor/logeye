@@ -569,7 +569,7 @@ def test_method_local_lambda_tracing(capsys):
 
 	assert res == 7
 	assert_has(out, "outer")
-	assert_has(out, "lambda") or assert_has(out, "f")
+	assert_has(out, "lambda")
 
 
 def test_deep_nested_method_definitions(capsys):

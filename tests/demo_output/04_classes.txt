@@ -1,0 +1,37 @@
+--- Construction ---
+(call) account <- BankAccount.__init__ args=('Ada') | kwargs={'balance': 100}
+(set) account.owner = 'Ada'
+(set) account.balance = 100
+(set) account.history = []
+
+--- Methods, and the attribute changes they make ---
+(call) account.deposit args=(50)
+(change) account.balance = 150
+(change) account.history.append(('deposit', 50)) -> [('deposit', 50)]
+(return) account.deposit args=(50) -> 150
+(call) account.withdraw args=(30)
+(change) account.balance = 120
+(change) account.history.append(('withdraw', 30)) -> [('deposit', 50), ('withdraw', 30)]
+(return) account.withdraw args=(30) -> 120
+
+--- Attributes changed from outside are reported too ---
+(change) account.owner = 'Ada Lovelace'
+
+--- Class methods and static methods ---
+(call) BankAccount.with_bonus args=('Grace')
+(call) bankaccount <- BankAccount.__init__ args=('Grace') | kwargs={'balance': 10}
+(set) bankaccount.owner = 'Grace'
+(set) bankaccount.balance = 10
+(set) bankaccount.history = []
+(return) BankAccount.with_bonus args=('Grace') -> BankAccount('Grace', balance=10)
+(call) BankAccount.fee args=(250)
+(set) BankAccount.fee.amount = 250
+(return) BankAccount.fee args=(250) -> 2.5
+
+--- A failing call is reported, then raises as usual ---
+(call) account.withdraw args=(1000)
+(raise) account.withdraw args=(1000) -! ValueError: insufficient funds
+...caught: insufficient funds
+
+--- Still a real BankAccount ---
+type(account) is BankAccount: True

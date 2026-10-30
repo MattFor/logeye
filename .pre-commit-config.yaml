@@ -1,0 +1,7 @@
+# Optional: `uvx pre-commit install` runs ruff before every commit
+repos:
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.16.5
+    hooks:
+      - id: ruff-check
+      - id: ruff-format

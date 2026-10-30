@@ -4,19 +4,20 @@ import os
 import inspect
 
 from . import config
-from string import Template
-from collections.abc import Callable, Iterable, Mapping, Sequence
-from typing import TYPE_CHECKING, TypeAlias, cast
-from .introspection.frames import _caller_frame, _get_location
+from collections.abc import Iterable, Mapping, Sequence
+from typing import TYPE_CHECKING, Callable, Optional, Tuple, cast
+from .introspection.frames import _relative_path
 
 if TYPE_CHECKING:
+	from typing_extensions import TypeAlias
+
 	from .core import Kind
 
 # Returns the line to write, or None to drop the event
-Formatter: TypeAlias = Callable[..., "str | None"]
+Formatter: TypeAlias = Callable[..., Optional[str]]
 
 # (positional argument count, accepts display flags)
-FormatterShape: TypeAlias = tuple[int, bool]
+FormatterShape: TypeAlias = Tuple[int, bool]
 
 
 def _payload_of(value: object) -> dict[str, object] | None:
@@ -61,6 +62,15 @@ def _is_simple_value(value: object) -> bool:
 def _display_name(name: str) -> str:
 	parts = [p for p in name.split(".") if not p.startswith("test_")]
 	return ".".join(parts) if parts else name
+
+
+def _safe_repr(value: object) -> str:
+	"""repr() that cannot take the logged program down with it"""
+
+	try:
+		return repr(value)
+	except Exception as exc:
+		return f"<{type(value).__name__} object; repr() raised {type(exc).__name__}>"
 
 
 def _pretty_arg(a: object) -> str:
@@ -113,13 +123,48 @@ def _format_op_arguments(op: str, payload: dict[str, object]) -> str:
 		if "key" in payload:
 			return repr(payload.get("key"))
 
+		# pop(-1) is just pop()
 		index = payload.get("index")
-		return "" if index is None else repr(index)
+		return "" if index is None or index == -1 else repr(index)
 
 	if op in ("clear", "reverse", "popitem"):
 		return ""
 
 	return repr(val) if "value" in payload else ""
+
+
+def _payload_items(payload: Mapping[str, object], key: str) -> list[object]:
+	items = payload.get(key)
+	# noinspection PyUnnecessaryCast
+	return list(cast("Iterable[object]", items)) if items else []
+
+
+def _format_observed(name: str, payload: Mapping[str, object], prefix: str, kind_prefix: str) -> str:
+	"""A change noticed only afterwards, written as the call on its line that made it"""
+
+	op = str(payload.get("op"))
+	added = _payload_items(payload, "added")
+	removed = _payload_items(payload, "removed")
+	arguments = payload.get("arguments")
+
+	# The one thing that went in is the argument; anything else is not known for sure
+	shown = ""
+	if arguments == 1 and len(added) == 1:
+		shown = repr(added[0])
+	elif arguments:
+		shown = "..."
+
+	if payload.get("function"):
+		call = f"{op}({', '.join(part for part in (name, shown) if part)})"
+	else:
+		call = f"{name}.{op}({shown})"
+
+	state = payload.get("state")
+
+	if len(removed) == 1:
+		return f"{prefix}{kind_prefix}{call} -> {removed[0]!r} | {state!r}"
+
+	return f"{prefix}{kind_prefix}{call} -> {state!r}"
 
 
 def _format_change_payload(
@@ -134,6 +179,9 @@ def _format_change_payload(
 	state = payload.get("state")
 
 	kind_prefix = "(change) " if include_kind else ""
+
+	if payload.get("observed"):
+		return _format_observed(name, payload, prefix, kind_prefix)
 
 	if op in ("setattr", "setitem"):
 		if _is_simple_value(val):
@@ -166,9 +214,7 @@ def _format_call_payload(args: tuple[object, ...], kwargs: dict[str, object]) ->
 	return " | ".join(parts)
 
 
-def _format_call_line(
-	prefix: str, kind: str, func_name: str, payload_str: str, tail: str
-) -> str:
+def _format_call_line(prefix: str, kind: str, func_name: str, payload_str: str, tail: str) -> str:
 	"""Join a call line, skipping the payload gap when there are no arguments"""
 	head = f"{prefix}({kind}) {func_name}"
 
@@ -234,6 +280,21 @@ def _default_formatter(
 
 				short_name = _last_name(name)
 
+				if payload.get("observed"):
+					added = _payload_items(payload, "added")
+					removed = _payload_items(payload, "removed")
+					heap = str(op).startswith("heap")
+
+					if len(added) == 1 and not removed:
+						verb = "Pushed" if heap else "Added"
+						where = "onto" if heap else "to"
+						return f"{prefix}{verb} {added[0]} {where} {short_name}"
+
+					if len(removed) == 1 and not added:
+						return f"{prefix}Popped {removed[0]} from {short_name}"
+
+					return _format_observed(_display_name(name), payload, prefix, "")
+
 				if op == "append":
 					return f"{prefix}Added {val} to the end of {short_name}"
 
@@ -267,18 +328,17 @@ def _default_formatter(
 					idx = payload.get("index")
 					return f"{prefix}Inserted {val} at index {idx} in {short_name}"
 
-			if (
-				kind == "set"
-				and payload is not None
-				and payload.get("type") == "function"
-			):
+				# setattr, update, clear, ...: no raw payload dict
+				formatted = _format_change_payload(_display_name(name), payload, prefix, include_kind=False)
+				if formatted is not None:
+					return formatted
+
+			if kind == "set" and payload is not None and payload.get("type") == "function":
 				defaults = _payload_defaults(payload)
 				short_name = _display_name(name)
 
 				if defaults:
-					rendered_defaults = ", ".join(
-						f"{k}={v!r}" for k, v in defaults.items()
-					)
+					rendered_defaults = ", ".join(f"{k}={v!r}" for k, v in defaults.items())
 					return f"{prefix}Defined {short_name}({rendered_defaults})"
 
 				return f"{prefix}Defined {short_name}()"
@@ -319,9 +379,6 @@ def _default_formatter(
 				args = _payload_args(payload)
 				kwargs = _payload_kwargs(payload)
 
-				if args and hasattr(args[0], "_logeye_name"):
-					args = args[1:]
-
 				arg_parts: list[str] = []
 				if args:
 					arg_parts.append(", ".join(_pretty_arg(a) for a in args))
@@ -338,11 +395,7 @@ def _default_formatter(
 				exc_type = payload.get("exception_type", type(exc).__name__)
 				call_sig = payload.get("call_signature")
 
-				func_name = (
-					_display_name(str(call_sig).split("(")[0])
-					if call_sig
-					else _display_name(name)
-				)
+				func_name = _display_name(str(call_sig).split("(")[0]) if call_sig else _display_name(name)
 
 				return f"{prefix}{func_name}() raised {exc_type}: {exc}"
 
@@ -403,19 +456,13 @@ def _default_formatter(
 		func_name = _display_name(name)
 		payload_str = _format_call_payload(args, kwargs)
 
-		return _format_call_line(
-			prefix, kind, func_name, payload_str, f"-! {exc_type}: {exc}"
-		)
+		return _format_call_line(prefix, kind, func_name, payload_str, f"-! {exc_type}: {exc}")
 
 	if kind == "yield" and payload is not None and "value" in payload:
 		func_name = _display_name(name)
-		payload_str = _format_call_payload(
-			_payload_args(payload), _payload_kwargs(payload)
-		)
+		payload_str = _format_call_payload(_payload_args(payload), _payload_kwargs(payload))
 
-		return _format_call_line(
-			prefix, kind, func_name, payload_str, f"-> {payload['value']!r}"
-		)
+		return _format_call_line(prefix, kind, func_name, payload_str, f"-> {payload['value']!r}")
 
 	if kind == "return" and payload is not None and "value" in payload:
 		result = payload["value"]
@@ -432,12 +479,6 @@ def _default_formatter(
 		args = _payload_args(payload)
 		kwargs = _payload_kwargs(payload)
 		target = payload.get("target")
-
-		# Drop self / cls
-		if args:
-			first = args[0]
-			if hasattr(first, "_logeye_name") or isinstance(first, type):
-				args = args[1:]
 
 		func_name = _display_name(name)
 		payload_str = _format_call_payload(args, kwargs)
@@ -472,15 +513,12 @@ def _formatter_call_shape(func: Formatter) -> FormatterShape:
 			sum(
 				1
 				for p in params
-				if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)
-				and p.name not in _DISPLAY_FLAGS
+				if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD) and p.name not in _DISPLAY_FLAGS
 			),
 			_FORMATTER_ARGUMENTS,
 		)
 
-	takes_flags = any(p.kind is p.VAR_KEYWORD for p in params) or all(
-		flag in names for flag in _DISPLAY_FLAGS
-	)
+	takes_flags = any(p.kind is p.VAR_KEYWORD for p in params) or all(flag in names for flag in _DISPLAY_FLAGS)
 
 	return positional, takes_flags
 
@@ -497,10 +535,7 @@ def _format_path(filename: str | None) -> str:
 		return filename
 
 	if config._g_path_mode == "project":
-		try:
-			return os.path.relpath(filename, config._g_project_root)
-		except Exception:
-			return filename
+		return _relative_path(filename)
 
 	if config._g_path_mode == "file":
 		return os.path.basename(filename)
@@ -522,49 +557,14 @@ def reset_output_formatter() -> None:
 	_formatter_shape = (_FORMATTER_ARGUMENTS, True)
 
 
-def _format_message(text: str, *args: object, **kwargs: object) -> str:
-	try:
-		return text.format(*args, **kwargs)
-	except Exception:
-		pass
-
-	frame = _caller_frame()
-	try:
-		if frame is not None:
-			namespace: dict[str, object] = {}
-			namespace.update(frame.f_globals)
-			namespace.update(frame.f_locals)
-
-			filename, _ = _get_location(frame)
-			namespace["apath"] = filename or ""
-			namespace["rpath"] = (
-				os.path.relpath(filename, config._g_project_root) if filename else ""
-			)
-			namespace["fpath"] = os.path.basename(filename) if filename else ""
-
-			try:
-				return text.format(**namespace)
-			except Exception:
-				pass
-
-			try:
-				return Template(text).safe_substitute(namespace)
-			except Exception:
-				pass
-	finally:
-		del frame
-
-	return text
-
-
 __all__ = [
 	"Formatter",
 	"FormatterShape",
-	"set_output_formatter",
-	"reset_output_formatter",
+	"_default_formatter",
+	"_format_path",
 	"_path",
 	"_payload_of",
-	"_default_formatter",
-	"_format_message",
-	"_format_path",
+	"_safe_repr",
+	"reset_output_formatter",
+	"set_output_formatter",
 ]

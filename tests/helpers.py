@@ -87,10 +87,7 @@ def assert_nested_order(ls, first_name, first_value, second_name, second_value):
 		if match(l, second_name, second_value) and i > i1
 	)
 
-	assert i1 < i2, (
-		f"Wrong nested order:\n"
-		f"{first_name}={first_value} -> {second_name}={second_value}\n{ls}"
-	)
+	assert i1 < i2, f"Wrong nested order:\n{first_name}={first_value} -> {second_name}={second_value}\n{ls}"
 
 
 # ===========================

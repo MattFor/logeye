@@ -1,0 +1,7 @@
+Hello Ada, 3 attempts left
+Hello Ada!
+Hello Ada, 3 attempts left
+This message comes from 07_messages.py
+(set) greeting = 'Welcome back, Ada'
+A literal pattern: $user
+No timestamp or location on this line

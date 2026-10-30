@@ -1,5 +1,0 @@
-[0.011s] demo_file_and_filter.py:35 (call) add args=(2, 3)
-[0.011s] demo_file_and_filter.py:29 (set) add.a = 2
-[0.011s] demo_file_and_filter.py:29 (set) add.b = 3
-[0.011s] demo_file_and_filter.py:31 (set) add.total = 5
-[0.011s] demo_file_and_filter.py:32 (return) add args=(2, 3) -> 5

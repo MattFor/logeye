@@ -1,0 +1,41 @@
+--- Containers built inside a traced function report each operation ---
+(call) plan_route
+(set) plan_route.stops = []
+(change) plan_route.stops.append('Paris') -> ['Paris']
+(change) plan_route.stops.append('Rome') -> ['Paris', 'Rome']
+(change) plan_route.stops.insert(0, 'London') -> ['London', 'Paris', 'Rome']
+(set) plan_route.visited = set()
+(change) plan_route.stops.pop(0) -> 'London' | ['Paris', 'Rome']
+(change) plan_route.visited.add('London') -> {'London'}
+(set) plan_route.fares = {}
+(change) plan_route.fares.Paris = 120
+(change) plan_route.fares.Paris = 100
+(return) plan_route -> ['Paris', 'Rome']
+
+--- An argument changed in place: the caller sees the change ---
+(call) grade args=([72, 95, 58])
+(set) grade.scores = [72, 95, 58]
+(set) grade.i = 0
+(change) grade.scores = [7, 95, 58]
+(change) grade.i = 1
+(change) grade.scores = [7, 10, 58]
+(change) grade.i = 2
+(change) grade.scores = [7, 10, 6]
+(change) grade.scores.sort() -> [6, 7, 10]
+(return) grade args=([72, 95, 58]) -> None
+the caller's list afterwards: [6, 7, 10]
+
+--- Logging a container directly ---
+(set) inventory = {'apples': 3, 'pears': 1}
+(change) inventory.apples = 5
+(change) inventory.pears = 0
+(change) inventory.plums = 7
+(set) stack = []
+(change) stack.append('first') -> ['first']
+(change) stack.append('second') -> ['first', 'second']
+(change) stack.pop() -> 'second' | ['first']
+
+--- Nested structures report the full path ---
+(set) game = {'player': {'hp': 100, 'items': []}}
+(change) game.player.hp = 75
+(change) game.player.items.append('sword') -> ['sword']

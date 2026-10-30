@@ -1,3 +1,0 @@
-[0.013s] demo_file_and_filter.py:54 (call) special
-[0.013s] demo_file_and_filter.py:45 (set) special.x = 100
-[0.013s] demo_file_and_filter.py:46 (return) special -> 100

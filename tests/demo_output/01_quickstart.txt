@@ -1,0 +1,10 @@
+(set) x = 10
+(set) y = 20
+x + y = 30
+x is 10 and y is 20
+(call) add args=(2, 3)
+(set) add.a = 2
+(set) add.b = 3
+(set) add.total = 5
+(return) add args=(2, 3) -> 5
+(change) x = 15

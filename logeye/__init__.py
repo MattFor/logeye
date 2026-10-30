@@ -1,5 +1,5 @@
 from .core import watch, _LogAPI
-from .emmiter import clear_log_file
+from .emitter import clear_log_file
 from .watcher import _uninstall_global_trace as stop_watching
 from .formatting import set_output_formatter, reset_output_formatter
 
@@ -13,26 +13,26 @@ from .config import (
 	set_global_log_file,
 )
 
-log = _LogAPI()  # noqa: E741
+log = _LogAPI()
 l = log  # noqa: E741
-w = watch  # noqa: E741
+w = watch
 
 # The "[0.000s]" origin is config._g_start_time, set at import
 
 __all__ = [
-	"log",
-	"l",
-	"watch",
-	"w",
-	"stop_watching",
 	"clear_log_file",
-	"toggle_logs",
-	"toggle_global_log_file",
-	"toggle_message_metadata",
-	"toggle_decorator_log_only",
-	"set_mode",
-	"set_path_mode",
-	"set_global_log_file",
-	"set_output_formatter",
+	"l",
+	"log",
 	"reset_output_formatter",
+	"set_global_log_file",
+	"set_mode",
+	"set_output_formatter",
+	"set_path_mode",
+	"stop_watching",
+	"toggle_decorator_log_only",
+	"toggle_global_log_file",
+	"toggle_logs",
+	"toggle_message_metadata",
+	"w",
+	"watch",
 ]

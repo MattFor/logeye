@@ -1,10 +1,15 @@
+from __future__ import annotations
+
 import os
 import sys
 
 from types import FrameType
 
+from .. import config
+
 # Resolved once, recomputing per frame walk dominated _caller_frame
-_LIBRARY_ROOT = os.path.abspath(os.path.dirname(os.path.dirname(__file__)))
+# normcase: Windows paths compare case-insensitively
+_LIBRARY_ROOT = os.path.normcase(os.path.abspath(os.path.dirname(os.path.dirname(__file__))))
 _LIBRARY_PREFIX = _LIBRARY_ROOT + os.sep
 
 # co_filename -> part of logeye itself? Interned per code object, so stays tiny
@@ -17,7 +22,7 @@ def _is_library_file(filename: str) -> bool:
 		return cached
 
 	if filename:
-		resolved = os.path.abspath(filename)
+		resolved = os.path.normcase(os.path.abspath(filename))
 		is_library = resolved == _LIBRARY_ROOT or resolved.startswith(_LIBRARY_PREFIX)
 	else:
 		is_library = False
@@ -26,16 +31,9 @@ def _is_library_file(filename: str) -> bool:
 	return is_library
 
 
-# Interpreter and third-party roots
-_EXTERNAL_ROOTS = tuple(
-	os.path.abspath(p) + os.sep
-	for p in {
-		os.path.dirname(os.__file__),
-		sys.prefix,
-		sys.base_prefix,
-	}
-	if p
-)
+# The standard library; third-party code is recognised by its site-packages path.
+# Not sys.prefix: projects live under it too (/usr/src/app in a Docker image)
+_EXTERNAL_ROOTS = (os.path.normcase(os.path.dirname(os.path.abspath(os.__file__))) + os.sep,)
 
 _external_file_cache: dict[str, bool] = {}
 
@@ -53,15 +51,20 @@ def _is_external_code(filename: str) -> bool:
 		# <string>, <stdin> are user code; <frozen ...> is not
 		is_external = filename.startswith("<frozen")
 	else:
-		resolved = os.path.abspath(filename)
-		is_external = (
-			"site-packages" in resolved
-			or "dist-packages" in resolved
-			or resolved.startswith(_EXTERNAL_ROOTS)
-		)
+		resolved = os.path.normcase(os.path.abspath(filename))
+		is_external = "site-packages" in resolved or "dist-packages" in resolved or resolved.startswith(_EXTERNAL_ROOTS)
 
 	_external_file_cache[filename] = is_external
 	return is_external
+
+
+def _relative_path(filename: str) -> str:
+	"""`filename` relative to the project root, or as is across Windows drives"""
+
+	try:
+		return os.path.relpath(filename, config._g_project_root)
+	except ValueError:
+		return filename
 
 
 def _get_location(frame: FrameType | None) -> tuple[str | None, int | None]:
@@ -71,8 +74,11 @@ def _get_location(frame: FrameType | None) -> tuple[str | None, int | None]:
 	return frame.f_code.co_filename, frame.f_lineno
 
 
-def _caller_frame() -> FrameType | None:
-	"""Walk outwards to the first frame not inside logeye itself"""
+def _caller_frame(skip_external: bool = False) -> FrameType | None:
+	"""
+	Walk outwards to the first frame not inside logeye itself
+	`skip_external` also walks past the stdlib and site-packages, for an event loop's frames
+	"""
 
 	try:
 		frame = sys._getframe(1)
@@ -81,7 +87,9 @@ def _caller_frame() -> FrameType | None:
 
 	try:
 		while frame is not None:
-			if not _is_library_file(frame.f_code.co_filename):
+			filename = frame.f_code.co_filename
+
+			if not _is_library_file(filename) and not (skip_external and _is_external_code(filename)):
 				return frame
 
 			frame = frame.f_back
@@ -92,8 +100,9 @@ def _caller_frame() -> FrameType | None:
 
 
 __all__ = [
-	"_get_location",
 	"_caller_frame",
-	"_is_library_file",
+	"_get_location",
 	"_is_external_code",
+	"_is_library_file",
+	"_relative_path",
 ]
